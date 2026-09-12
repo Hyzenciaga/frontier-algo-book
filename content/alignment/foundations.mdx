@@ -1,0 +1,69 @@
+# 对齐训练的数学地基
+
+## 直觉
+
+给定提示 $x$，自回归策略逐 token 定义 $\pi_\theta(y_t\mid x,y_{\lt t})$，整段回答概率是各条件概率的乘积。对齐不改变这个机制；它改变哪些完整轨迹更常出现。提示可视作状态、token 为动作、整段回答为一条轨迹，评价可在末尾才给出。
+
+## 前置知识与机制推导
+
+示范的最大似然目标是 $L_{SFT}=-\sum_t\log\pi_\theta(y_t^*\mid x,y^*_{\lt t})$。若得到序列奖励 $r$，一个基本目标为
+
+$$
+\max_\pi\;\mathbb E[r(x,y)]-\beta D_{KL}(\pi(\cdot\mid x)\Vert\pi_{ref}(\cdot\mid x)).
+$$
+
+在有限输出空间对每个概率求导并加归一化约束，解为 $\pi^*(y\mid x)\propto\pi_{ref}(y\mid x)\exp(r/\beta)$。KL 因而是偏离原策略的价格，不是安全证明。策略梯度利用 $\nabla J=\mathbb E[\sum_t\nabla\log\pi(y_t\mid s_t)A_t]$；减去仅依赖状态的基线不改期望、能降方差。
+
+## 数据流程
+
+先固定提示分布与评价规范，再收集示范、比较或验证结果；按提示而非随机 token 切分，防近重复泄漏。记录模板、mask、行为策略 log-prob、长度、奖励和 KL。PPO 数据必须接近当前行为策略；旧数据的概率比会失真。离线偏好数据也只代表产生它的模型附近。
+
+## 从序列概率到一次更新
+
+设词表只有 `A,B`，提示后目标序列为 `A,B`。第一个位置 $p(A)=0.8$；在已知 `A` 后 $p(B\mid A)=0.5$，故整段概率是 $0.8\times0.5=0.4$，而非两个概率的平均。负对数似然为 $-\log0.4=0.916$，可拆成 $-\log0.8-\log0.5=0.223+0.693$。这种可加性使变长序列能按 token 求和，也解释了为何一个很低概率 token 会支配整句 loss。
+
+再看 softmax 的一个位置。$p_j=e^{z_j}/\sum_k e^{z_k}$，对正确类别 $c$ 的 loss 是 $-z_c+\log\sum_k e^{z_k}$，所以 $\partial L/\partial z_j=p_j-\mathbb1[j=c]$。若 $p=(0.8,0.2)$、目标是第二类，梯度是 $(0.8,-0.8)$；学习率 $0.1$ 的梯度下降给原 logits 的增量是 $(-0.08,+0.08)$，下一次 softmax 更偏向目标。这是对齐训练所有“提高好轨迹概率”表述在单位置上的实际含义。
+
+## 小例子
+
+参考策略对短答、长答为 $(0.7,0.3)$，奖励为 $(0.2,1.0)$，$\beta=0.5$。闭式解会偏好长答但不把短答归零。
+
+```python
+"""枚举序列策略、回报与 KL 正则（仅标准库）。"""
+import math
+ref = {"short": .70, "long": .30}; reward = {"short": .2, "long": 1.0}; beta = .5
+z = sum(ref[a] * math.exp(reward[a] / beta) for a in ref)
+policy = {a: ref[a] * math.exp(reward[a] / beta) / z for a in ref}
+kl = sum(policy[a] * math.log(policy[a] / ref[a]) for a in ref)
+print(policy, "KL=", round(kl, 4))
+```
+
+运行 `python examples/alignment/foundations.py` 输出约 `long: 0.680`、`KL=0.3056`。 [下载示例](../../examples/alignment/foundations.py)
+
+## 常见误区
+
+交叉熵低只表示复现标签更好；KL 小不推出正确或安全。token 概率也不等于整段回报。遗漏“诚实、简洁、可读”的奖励维度时，优化器会稳定地利用遗漏。
+
+## 基线为何不改期望
+
+对固定状态 $s$ 和任意不依赖动作的 $b(s)$，有 $\mathbb E_{a\sim\pi}[b(s)\nabla\log\pi(a|s)]=b(s)\sum_a\pi(a|s)\nabla\log\pi(a|s)=b(s)\nabla\sum_a\pi(a|s)=0$。所以回报可替换为 $R-b(s)$。这只是在期望上成立：若基线估计来自同一批有限样本，或错误地依赖当前动作，仍可能引入偏差。价值网络的作用是拟合条件期望回报，从而减小而非消灭方差。
+
+## 自测问题
+
+1. 为什么奖励同加常数不改变最优策略？
+2. $\beta$ 减小会怎样？
+3. 为什么基线不改变梯度期望？
+
+<details>
+<summary>答案</summary>
+
+1. 常数进入归一化项。
+2. 策略更激进地偏离参考。
+3. 条件于状态的 score function 期望为零。
+
+</details>
+
+## 原始参考资料
+
+- [OpenAI Spinning Up：策略梯度](https://spinningup.openai.com/en/latest/spinningup/rl_intro3.html)
+- [InstructGPT](https://arxiv.org/abs/2203.02155)

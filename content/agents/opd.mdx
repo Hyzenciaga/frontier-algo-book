@@ -1,0 +1,90 @@
+# On-Policy Distillation（OPD）：在学生会抵达的状态上教学
+
+离线蒸馏把教师完成的答案当作训练语料；学生却在部署时按自己的历史逐 token 生成。早期一个小偏差会改变后缀的上下文，学生随后抵达的状态可能从未出现于教师轨迹。On-Policy Distillation（OPD）改变的首先不是“要模仿谁”，而是**在哪些状态模仿**：由当前学生生成前缀，再让教师在这些前缀上给出下一 token 的软目标。它因此可视为互动式模仿学习在语言模型中的实现。
+
+## 前置知识
+
+令 $x$ 是题目，$h_t=(x,y_{<t})$ 是第 $t$ 步之前的历史，学生和教师策略分别为 $\pi_S(\cdot\mid h_t)$、$\pi_T(\cdot\mid h_t)$。策略并非选一个词，而是整个词表上的概率分布。KL 散度比较两个分布：$D_{KL}(p\Vert q)=\sum_v p(v)\log[p(v)/q(v)]$。还要分开两件事：rollout 的来源决定状态分布；损失函数的方向决定哪些概率误差被强调。
+
+## 机制
+
+一次 OPD 更新先从当前学生采样 $y\sim\pi_S(\cdot\mid x)$，因而训练状态服从学生诱导的 $d^{\pi_S}(h)$。然后在每个（或筛选后的）学生前缀请求教师分布。常见前向目标为
+
+$$
+L_F=\mathbb E_{h\sim d^{\pi_S}}[D_{KL}(\pi_T\Vert\pi_S)]
+$$
+
+它等价于以教师概率加权的交叉熵；对学生 logit 的梯度会提升教师比学生更确信的 token。反向目标 $D_{KL}(\pi_S\Vert\pi_T)$ 则按学生已给出的概率加权，对教师低概率而学生高概率的模式惩罚更强，常呈现 mode-seeking 性质。两者不是可随意互换的名字：词表很大、教师概率只能部分取得、且学生 rollout 会变时，数值稳定性和查询成本都会不同。实践还会使用 top-$k$ 教师项、JS 或采样 token 的近似；近似改变的是估计量，必须说明它不再是全词表 KL。
+
+梯度条件同样关键。若把采样到的 token 当作固定数据，前向 KL 对学生参数求导即可；若要对“状态分布也依赖学生参数”求严格梯度，则出现策略梯度项。许多实现停止 rollout 图的梯度，把它当作每轮重新采样的监督批次，以较低方差换取近似。更新后 $\pi_S$ 改变，旧状态就渐渐 off-policy，故需要短周期重采样或处理陈旧数据。
+
+教师访问决定可做什么。能取 logits 时可做密集分布蒸馏；仅有 API 文本时只能把教师续写、偏好比较或最终验证转成较稀疏信号；教师在学生错误前缀上没有能力、或拒绝给概率时，也不能假装获得了全分布监督。近期机制研究进一步指出，学生与教师的思维模式须兼容，且教师需提供学生尚未见过的能力；单纯更高的教师分数并不足够。
+
+## 例子
+
+下面把“错误前缀上下一步该检查”压缩为三词词表。程序计算两种 KL，并打印前向交叉熵对学生 logit 的负梯度方向；可运行文件见 [完整 Python 示例](../../examples/agents/opd.py)。
+
+```python
+"""A tiny, finite-vocabulary OPD calculation; Python standard library only."""
+import math
+
+student = {"check": 0.70, "guess": 0.25, "stop": 0.05}
+teacher = {"check": 0.90, "guess": 0.05, "stop": 0.05}
+
+def kl(p, q):
+    return sum(v * math.log(v / q[k]) for k, v in p.items() if v)
+
+print("forward KL T||S:", round(kl(teacher, student), 4))
+print("reverse KL S||T:", round(kl(student, teacher), 4))
+for token in student:
+    # Negative cross-entropy gradient with respect to the student logit.
+    print(token, "target-minus-current:", round(teacher[token] - student[token], 2))
+```
+
+输出为：
+
+```text
+forward KL T||S: 0.1457
+reverse KL S||T: 0.2264
+check target-minus-current: 0.2
+guess target-minus-current: -0.2
+stop target-minus-current: 0.0
+```
+
+这里没有神经网络、采样器或教师服务，只有一次已给定前缀上的精确分布计算。真实 LLM 训练需要批量采样长序列、教师 logits 或受限替代信号、token 对齐、反向传播、优化器与 KL/熵约束；此例只展示损失为何会把概率从 `guess` 移向 `check`。
+
+## 深入：分布匹配为何仍会失败
+
+OPD 处理的是 exposure bias，不会自动消除能力差距。若学生在长度、工具格式或推理语言上产生教师极少见的前缀，教师的条件分布可能很平坦，或者其高概率续写只是在修辞上连贯而不能恢复任务。此时把每一步 KL 加总，会得到很“密”的监督，却未必得到有用的方向。工程上应监控教师和学生在已访问状态上的熵、top-$k$ 重叠、KL 分位数以及教师续写后的 verifier 成功率，而不是只看平均损失。
+
+还要注意序列长度造成的选择偏差。只在学生答对的样本上蒸馏，回避了错误状态；只在错误样本上蒸馏，则会让训练分布过度偏向罕见灾难。常见折中是按长度、结果、置信度和教师可用性分层采样，并保留独立的端到端任务评测。多教师情形也不是简单平均 logits：需要在每个前缀明确路由、温度、权重与冲突处理，否则平均会制造任何教师都不认可的分布。
+
+在产品训练中还应明确教师查询预算。逐 token 请求全词表 logits 的代价随序列和词表增长；缓存只在前缀和教师版本相同时有效，异步队列又会引入陈旧 rollout。可先离线冷启动到共享格式，再在最有信息量的学生状态上做 OPD；但任何筛选准则都应记录，避免把难例悄悄排除后误读为训练稳定。最终检验仍是学生独立生成时的任务成功、长度与鲁棒性，而非训练批的 KL 下降。
+
+温度也会改变教学信号。教师分布过尖时，低概率但有价值的替代步骤被抹去；过平时，所有 token 的微小概率误差会稀释决策重点。应把温度、截断和归一化写入实验配置，并确认学生、教师 tokenizer 与词表映射可比较。若模型 tokenizer 不同，所谓逐 token KL 需要额外的概率路由或共同表示；简单按位置相减没有数学意义。对含工具调用的序列，还需规定哪些控制 token 受蒸馏、哪些只由格式校验约束。
+
+诊断时应同时保存学生前缀、教师版本和查询时间。否则某次改善究竟来自新教师、采样温度还是优化器变化无法归因。把这些工件与端到端失败样本一起审阅，通常比继续堆叠损失项更能发现分布不兼容。
+
+## 常见误区
+
+“on-policy”不表示学生无监督地从错误中变强；它只规定样本状态由学生访问。没有可靠教师、环境回报或偏好标注，采样不会凭空产生学习信号。OPD 也不是 RL 的同义词：前者拟合教师条件分布，RL 最大化环境回报；二者可以组合，例如以 KL 保持语言能力、以任务奖励选择行为。最后，不要把教师在正确轨迹上强理解为它在任意学生前缀上都强；异常上下文的教师质量本身是应测量的变量。
+
+## 自测
+
+1. 为什么教师生成更多正确解答，仍不能覆盖学生把单位看错后的状态？
+2. $D_{KL}(T\Vert S)$ 与 $D_{KL}(S\Vert T)$ 分别由谁的概率加权？
+3. 只有教师最终答案而没有 logits 时，损失和可归因粒度会怎样变化？
+
+<details>
+<summary>参考答案</summary>
+
+1. 轨迹前缀不同，条件分布也不同。
+2. 前者由教师，后者由学生。
+3. 通常退为序列级模仿、偏好或验证奖励，密集 token 蒸馏不再直接可得。
+
+</details>
+
+## 原始资料
+
+- Agarwal 等，[On-Policy Distillation of Language Models: Learning from Self-Generated Mistakes](https://proceedings.iclr.cc/paper_files/paper/2024/file/5be69a584901a26c521c2b51e40a4c20-Paper-Conference.pdf)，ICLR 2024。
+- Li 等，[Rethinking On-Policy Distillation of Large Language Models](https://arxiv.org/abs/2604.13016)，关于成功条件与 token 机制的实证研究。

@@ -1,0 +1,60 @@
+# RLHF：把人的比较转成优化信号
+
+## 直觉
+
+人通常更容易回答“两条回复哪条更好”，而难以写出完整奖励函数。RLHF 先把这种相对判断压缩为奖励模型，再让策略在 KL 约束下追求该模型的高分。
+
+## 前置知识与机制推导
+
+对同一 $x$ 的胜者 $y_w$、败者 $y_l$，Bradley--Terry 假设 $P(y_w\succ y_l)=\sigma(r_\phi(x,y_w)-r_\phi(x,y_l))$，故 $L_{RM}=-\log\sigma(r_w-r_l)$。奖励只由差值识别：全体加同一常数不变。随后最大化 $\mathbb E[r_\phi]-\beta KL(\pi\Vert\pi_{ref})$；RL 阶段的梯度并不穿过离散 token，而用 log-prob score function 乘优势估计。
+
+## 数据流程
+
+从 SFT/当前策略对每个提示采多条候选，随机化左右位置给标注者比较；保留分歧、长度与来源。训练/验证要按 prompt 切分，评估 RM 的 held-out pair accuracy，也要用人盲评最终策略。候选始终来自旧模型会造成分布偏移：新策略可能找到 RM 从未见过的漏洞，因此需在线再采样、审计和 KL。
+
+## 一对比较如何变成更新，及其失效方式
+
+若胜者/败者奖励为 $(1.2,0.3)$，差 $d=0.9$，预测偏好概率为 $\sigma(d)=0.711$，NLL 为 $0.341$。对胜者奖励的导数是 $\sigma(d)-1=-0.289$，梯度下降提高 $r_w$；对败者则为 $+0.289$。这只拟合“谁更好”，不校准绝对分数。RM 接着把一个未标注回复打成 10 分时，策略会通过策略梯度提高产生该回复的 token 概率；RM 本身通常冻结，不能在该离散生成路径上自动纠错。
+
+reward hacking 出现在代理指标和真实偏好分叉时。例如标注数据里长摘要常更受偏好，RM 学到长度特征；PPO 继续优化后，策略可能输出冗长、重复却覆盖关键词的摘要。检测要同时画 RM 分数、人评、长度和 KL 随训练步的曲线，并用长度配平的比较集和对抗提示复核。修正不是只把 KL 调大：需要补入该漏洞处的新比较、改 rubric 或把长度作为受控变量。RM 的 pair accuracy 即使很高，也可能只是在容易比较的旧分布上高。
+
+## 小例子
+
+```python
+"""Bradley--Terry 比较损失和奖励可加常数的不辨识性。"""
+import math
+r_win, r_lose = 1.2, .3
+p = 1/(1+math.exp(-(r_win-r_lose)))
+print("P(win preferred)=", round(p, 3), "NLL=", round(-math.log(p), 3))
+print("shift invariant:", round(1/(1+math.exp(-((r_win+5)-(r_lose+5)))), 3))
+```
+
+运行 `python examples/alignment/rlhf.py` 两个概率均为 `0.711`。 [下载示例](../../examples/alignment/rlhf.py)
+
+## 常见误区
+
+RM 准确率高不代表优化后仍可靠；它只在比较数据分布上被验证。长度若与“好”共现，模型可能刷长文；这需要长度配平和最终人评。比较也不是客观真值，规范和标注者分歧必须显式保留。
+
+## 不辨识性与受 KL 约束的策略
+
+Bradley--Terry 的 likelihood 只看 $r_w-r_l$，故 $r'(x,y)=r(x,y)+c(x)$ 完全同样；不能把 RM 的 7 分解释成跨提示的绝对效用。固定奖励时，加入归一化约束求 $\max_\pi\sum_y\pi(y)r(y)-\beta\sum_y\pi(y)\log(\pi(y)/\pi_{ref}(y))$，一阶条件给出 $\pi^*(y)\propto\pi_{ref}(y)e^{r(y)/\beta}$。这解释 KL 的指数倾斜，也说明 reward scale 与 $\beta$ 只能相对解释。
+
+## 自测问题
+
+1. 为何 RM 只能识别相对奖励？
+2. 为什么要在线补数据？
+3. KL 解决什么、不解决什么？
+
+<details>
+<summary>答案</summary>
+
+1. 损失只含奖励差。
+2. 新策略改变了 RM 的输入分布。
+3. 它限制漂移，不能补齐遗漏偏好。
+
+</details>
+
+## 原始参考资料
+
+- [InstructGPT](https://arxiv.org/abs/2203.02155)
+- [Learning from human preferences](https://openai.com/index/learning-from-human-preferences/)

@@ -1,0 +1,94 @@
+# ACE：把上下文维护为可验证、可演化的工作手册
+
+Agentic Context Engineering（ACE）把“改进代理”从重写一整段提示词，改写成维护一份有结构的 playbook。它的核心主张很具体：模型权重可以不动；每次任务执行所暴露的成功、失败和工具反馈，经由专门角色变成小的增量更新；确定性程序再把增量合入长期工作手册。下一次调用读到这本手册，因而行为改变。该方法讨论的是**上下文适应**，不是持续微调。
+
+## 前置知识
+
+一次 LLM 调用的上下文包括系统指令、任务、工具说明、检索片段和记忆；权重是跨调用持久的模型参数。把经验反复压缩为一段摘要很诱人，但会出现篇幅偏好：常见原则留下，罕见的边界条件消失；一次错误重写还可能抹去原有证据。ACE 所说的 context collapse 正是这种累积改写导致的内容退化。要避免它，记忆不是自由文本，而应是一组可寻址对象，至少有规则、适用条件、证据和版本。
+
+## 机制
+
+ACE 将一次闭环分成 Generator、Reflector、Curator。Generator 以当前 playbook $P_t$、问题和工具观察为条件，生成完整轨迹 $\tau=(o_0,a_0,\ldots,o_T)$；它既产出答案，也留下调用参数、错误码、检查结果等可审计事实。Reflector 不直接改手册，而把轨迹与环境反馈 $f(\tau)$ 分离地分析，输出可操作的经验：什么策略在什么条件下奏效，失败是因计划、工具、检索还是验证，证据是什么。把“评价”从“编辑”剥离，能让后者不必在同一轮同时判断事实和组织篇幅。
+
+Curator 把经验转为 delta：`add`、`revise`、`deprecate` 或计数更新，而不是返回新的整份 prompt。一个实用条目可建模为
+
+$$
+e=(id,\;rule,\;scope,\;evidence,\;h^+,\;h^-,\;version)
+$$
+
+其中稳定 `id` 是确定性合并的前提：同一问题的后续证据只更新同一条；新规则显式新增；冲突规则并存并用 scope 区分。合并程序按键去重、累计 helpful/harmful 计数、保留来源，并在 token 预算下按效用和覆盖范围排序或裁剪。它应是可重复的纯函数 $P_{t+1}=merge(P_t,\Delta_t)$：相同输入产生相同结果。模型可以生成候选 delta，但不能把“模型再次概括”当作合并规则；否则难以复现，也重新引入摘要漂移。
+
+部署时还要有反馈闭环：检索器按任务选择相关条目，Generator 依此行动，执行器写入真实结果，Reflector 归因，Curator 提议可追踪变化，离线评测决定保留、回滚或降权。没有保留集，条目很容易只记住训练任务表面形式。公开 ACE 实现也将三角色、增量更新和带正负计数的确定性合并列为架构要点；具体字段和排序策略仍是系统设计选择。
+
+## 例子
+
+下面例子把自然语言反思已经抽象为三条结构化事件，演示 Curator 如何用稳定键合并，而非重写整个手册；可运行文件见 [完整 Python 示例](../../examples/agents/ace.py)。
+
+```python
+"""A deterministic miniature of ACE's curator, not an LLM implementation."""
+from dataclasses import dataclass
+
+@dataclass
+class Rule:
+    text: str
+    helpful: int = 0
+    harmful: int = 0
+
+playbook = {"units": Rule("先确认币种和最小单位", helpful=1)}
+reflections = [("units", "先确认币种和最小单位", True),
+               ("scope", "只在接口元数据缺失时询问单位", True),
+               ("units", "先确认币种和最小单位", False)]
+
+for key, text, worked in reflections:       # deterministic merge by stable key
+    rule = playbook.setdefault(key, Rule(text))
+    rule.helpful += int(worked)
+    rule.harmful += int(not worked)
+for key in sorted(playbook):
+    rule = playbook[key]
+    print(f"{key}: +{rule.helpful} -{rule.harmful} | {rule.text}")
+```
+
+实测输出：
+
+```text
+scope: +1 -0 | 只在接口元数据缺失时询问单位
+units: +2 -1 | 先确认币种和最小单位
+```
+
+这段程序没有 Generator、LLM 调用、向量检索或真实的 Reflector；`reflections` 是人为给定的、已结构化反馈。真实系统最难的部分恰是从嘈杂轨迹可靠抽取 scope 与证据，并避免相近规则错误合并；它还需持久存储、权限隔离、检索评估与回滚，而不只是计数器。
+
+## 深入：数据结构决定可维护性
+
+把 playbook 存为一段 Markdown 会使“修改哪一条”成为语言模型猜测。较稳妥的实现把条目以 JSON、数据库行或带 front matter 的文档保存：`id` 用于幂等写入，`rule` 是可执行建议，`scope` 描述触发条件，`evidence` 指向轨迹和 verifier，`status` 支持弃用，计数反映经验证的历史。检索时先用任务和 scope 过滤，再在预算内按相关度与置信度排序；这样不会把所有历史规则塞进每次上下文。
+
+计数也不应被当作真理投票。一次高风险失败可能压过十次低风险成功，来源不同的反馈可信度也不同。因此 Curator 的确定性部分负责保存和合并，是否晋升为默认策略仍应由预先定义的评测或人工审核决定。版本快照让系统能够回答“这条规则何时导致回归”，也让在线适应可在出现坏 delta 后退回到上一份经过验证的手册。
+
+对工具代理而言，经验条目最好把“应做什么”和“如何证实做过”分开。例如规则可以要求先读取 schema，证据则是 schema 调用成功和字段类型匹配；缺少证据的漂亮建议只能作为候选，不宜直接注入默认上下文。这样也能测量检索质量：命中的条目是否真正被执行、执行后是否提升 verifier 结果、未命中是否造成可分类失败。上下文工程的收益来自闭环中的这些可观测连接，而非文案本身。
+
+当规则达到 token 预算上限，裁剪也应有语义：优先保留高影响、覆盖互补且证据充分的条目；把低频但关键的安全规则放在不可裁剪区；将过时条目迁入可检索档案而非静默删除。否则“压缩成功”可能只是让系统忘记最难的问题。
+
+因此，ACE 的评估单位不应只是最终答案，也应包括 delta 的有效率、规则冲突率、检索命中后的采纳率与回滚次数。这些过程指标能指出问题出在生成、反思、合并还是检索。
+
+## 常见误区
+
+“把 prompt 越写越长”不是 ACE。关键在于条目粒度、检索、增量语义、证据与验收。更不能把更新 playbook 称为模型权重学习：同一基础模型换一份上下文即可恢复原行为。自然执行反馈也未必是真值：测试可能错、工具可能超时、成功可能来自偶然捷径。对每条经验记录来源、时间和适用范围，既是调试需要，也能防止敏感信息被未经审查地永久写入记忆。
+
+## 自测
+
+1. 为什么反思器和策展器分开，比一次“请总结经验”更可审计？
+2. 哪些字段能让两条看似冲突的规则安全共存？
+3. 若增量使验证集下降，应改计数、回滚条目还是重写整个 playbook？为什么？
+
+<details>
+<summary>参考答案</summary>
+
+1. 可以分别检查事实归因和编辑决定。
+2. `scope`、证据、版本和稳定标识。
+3. 应先定位并回滚或降权导致回归的条目；全量重写丢失因果关系。
+
+</details>
+
+## 原始资料
+
+- Zhang 等，[Agentic Context Engineering: Evolving Contexts for Self-Improving Language Models](https://arxiv.org/abs/2510.04618)，ICLR 2026。
+- [ACE 作者公开实现](https://github.com/ace-agent/ace)，用于核对三角色、增量 delta 和确定性合并的实现方向。

@@ -1,0 +1,71 @@
+import {GrpoLab} from '@site/src/components/AlgorithmLab';
+
+# GRPO：用组内相对回报替代价值基线
+
+## 直觉
+
+同一题一次采样 $G$ 条解答，GRPO 不训练额外价值网络，而让每条解相对同组均值决定更新方向。它特别适合结果可判的推理题：同题的难度差在组内相减后大多消失。
+
+## 前置知识与机制推导
+
+对 prompt $q$ 的回报 $r_i$，优势常取 $A_i=(r_i-\bar r)/(s_r+\epsilon)$，其中 $\bar r=G^{-1}\sum_i r_i$。每个 token 继承该序列优势并以 PPO 式 ratio 优化，同时对参考策略正则。若回报全相等，奖励驱动的组内优势为 $A_i=0$；这只表示该组不能区分哪条答案应提高。相比 PPO，GRPO 省去 value head 的内存与回归误差，却以多次采样和有限组内基线换取方差控制。
+
+## 数据流程
+
+按题目分组采样，执行 verifier，组合正确性、格式和长度奖励；在组内归一化后训练。日志必须按题看 pass rate、组方差、零方差比例、答案长度和 KL。$G$ 太小时估计高噪；题目过易/过难时整组全一或全零，没有梯度。验证器若可被格式投机，组内相对化不会修复它。
+
+## token-level 目标与组内边界
+
+原始 GRPO 对每个问题 $q$ 采 $o_i$，用组回报形成 $\hat A_i$，并对每条答案的有效 token 平均优化近端项；一种常见写法为
+
+$$
+\frac1G\sum_i\frac1{|o_i|}\sum_t\left[\min\left(r_{i,t}(\theta)\hat A_i,\operatorname{clip}(r_{i,t},1-\epsilon,1+\epsilon)\hat A_i\right)-\beta D_{i,t}\right].
+$$
+
+其中 $r_{i,t}=\pi_\theta(o_{i,t}\mid q,o_{i,\lt t})/\pi_{old}(o_{i,t}\mid q,o_{i,\lt t})$。常见的采样 KL 项写作 $D_{i,t}=k_3=\pi_{ref}/\pi_\theta-\log(\pi_{ref}/\pi_\theta)-1$，比值取该已采样 token 的条件概率。在 $\pi_\theta$ 自己的采样分布下，它的期望等于 token 级 $D_{KL}(\pi_\theta\Vert\pi_{ref})$；rollout 若来自 $\pi_{old}$，则不应无条件称其为对当前策略 KL 的严格无偏估计。必须说明使用的采样分布、近似和 mask。序列奖励被复制给所有 token，不表示每一步都已被验证正确，只是 REINFORCE 的信用分配近似。
+
+例如回报 $(1,0,1,0)$，均值 $0.5$、总体标准差 $0.5$，优势为 $(1,-1,1,-1)$：正确样本所有 token 得正的奖励代理项。若 $(1,1,1,1)$ 或 $(0,0,0,0)$，标准差为零；安全做法是将该组优势置零/跳过并记录比例，不能靠极小 $\epsilon$ 人造巨大梯度。这只表示 reward-based surrogate 没有组内信号；KL 项及与其他样本共享的参数仍可能带来梯度。长度也会偏：若按 token 求和，长解有更多更新项；若按序列平均，各序列总权重相同，而长序列的每个 token 权重更小。奖励是否已含长度惩罚、损失如何归一化，必须共同报告。
+
+## 小例子
+
+```python
+"""组内回报归一化；常数奖励没有学习信号。"""
+import math
+rewards = [1., 0., 1., 0.]; mean = sum(rewards)/len(rewards)
+std = math.sqrt(sum((x-mean)**2 for x in rewards)/len(rewards))
+advantages = [(x-mean)/(std+1e-8) for x in rewards]
+print("mean=", mean, "advantages=", [round(x, 3) for x in advantages])
+```
+
+运行 `python examples/alignment/grpo.py` 输出优势约 `[1,-1,1,-1]`；若四项都为 1，则应跳过或令更新为零。 [下载示例](../../examples/alignment/grpo.py)
+
+## 交互实验：组内优势实验
+
+<GrpoLab />
+
+## 常见误区
+
+GRPO 不是“无需基线”：组均值就是随机基线。把不同题混入同一组会把题目难度误当答案质量。只奖励最终正确可能鼓励不可读推理，须加入格式约束和抽样人工审计。
+
+## 组大小、相关性与标准差约定
+
+同一 prompt 的样本并非独立：共享解题模式会令有效样本数小于 $G$。二元正确率为 $p$ 时，理论总体方差是 $p(1-p)$；若组内恰有 $k$ 个成功，均值为 $k/G$，总体标准差为 $\sqrt{(k/G)(1-k/G)}$。有些实现用样本标准差（分母 $G-1$），数值会相差 $\sqrt{G/(G-1)}$；论文、代码和复现实验必须统一。增大 $G$ 同时提高“至少有正负样本”的概率并增大生成成本，且不能消除相关性。
+
+## 自测问题
+
+1. 为什么全对组没有相对学习信号？
+2. $G$ 增大带来什么代价？
+3. GRPO 省掉了什么？
+
+<details>
+<summary>答案</summary>
+
+1. 所有回报减均值为零；KL 项仍可能有梯度。
+2. 更多生成和验证计算。
+3. 通常是显式 value model。
+
+</details>
+
+## 原始参考资料
+
+- [DeepSeekMath：GRPO](https://arxiv.org/abs/2402.03300)

@@ -1,0 +1,100 @@
+# EAGLE：预测目标模型的特征，再长出草稿树
+
+## 前置：草稿不必在 token 空间逐词建模
+
+EAGLE（Extrapolation Algorithm for Greater Language-model Efficiency）是面向特定目标模型训练的投机草稿器。普通草稿模型直接近似下一个 token 分布；EAGLE 把目标模型的内部表征当作更平滑的预测对象：先外推目标 Transformer 的倒数第二层特征，再将预测特征与 token 关联，得到候选。目标模型仍负责验证；随机采样时仍服从 $\min(1,p/q)$ 接受和正残差修正，因而正确性属于投机采样框架，而非“特征预测天然正确”。
+
+设目标第 $L-1$ 层在位置 $t$ 的隐藏向量为 $h_t\in\mathbb{R}^d$。草稿器给出 $\hat h_{t+1}=D_\theta(h_{\le t},y_{\le t})$，词表头把它映成 logits $z= W\hat h+b\in\mathbb{R}^{|V|}$。真正的目标模型会对候选路径重新得到 $p(y_{t+1}\mid y_{\le t})$。因此 $d$ 是隐藏宽度，$|V|$ 是词表大小；混淆这两个 shape 会导致把连续特征误当 token id 的实现错误。
+
+## 原理：移位 token 与草稿树
+
+单独从特征预测特征存在歧义：同一语义状态在不同 token 续写下可分叉。原始 EAGLE 将 token 序列以一个时间步移位地送入特征自回归过程，使预测下一特征时可见已确定的前一 token；训练目标同时约束特征与 token 续写。轻量草稿模型比完整目标网络小，但仍需与目标内部状态耦合训练，不能把任意小模型接上就称为 EAGLE。
+
+推理常将多个 top-k 候选组织成树。树节点保存一个 token、其草稿概率和父指针；不同分支以 tree attention mask 防止相互读取。目标模型对展平后的节点作一次前向，验证从根向下连续可接受的路径。树提高一次验证覆盖的候选数，却消耗更多 KV/cache 和词表 logits；最长树不一定带来最高吞吐。
+
+## 三个版本应如何区分
+
+**EAGLE** 提出特征级自回归草稿和静态树式推测。**EAGLE-2** 关注“树该如何长”：用草稿置信度估计候选的接受潜力，并随上下文动态调整树的宽度、深度与预算。**EAGLE-3** 进一步以训练—推理一致的方式模拟草稿轨迹，并融合低、中、高层特征来改善草稿质量；论文把它描述为 training-time test 与多层特征融合。三者都不是绕开目标验证的替代品，报告速度时也必须写明目标模型、树预算、batch、硬件和是 latency 还是 throughput。
+
+## 具体算例
+
+假设 $d=3, |V|=4$，当前目标特征为 $h_t=[0.4,0.6,0.2]$。草稿头先预测 $\hat h_{t+1}$，经 $W\hat h+b$ 排出“春、天”两个子节点；分别以“春”“天”作为移位 token 再预测下一层，得到两条深度为 2 的候选。目标验证“春→雨”时，若第一点被拒绝，后代“雨”没有资格提交；若第一点接受而第二点拒绝，则依投机采样在第二点做残差修正。树中另一个分支并不是免费的备选答案。
+
+## 可运行代码
+
+[eagle.py](../../examples/inference/eagle.py) 只用标准库构造 $3$ 维特征、$4\times3$ 输出头和两层候选树。数字完全是教学用，程序明确不测性能，也没有声称模拟训练好的 EAGLE。
+
+```python
+from math import exp
+VOCAB = ("春", "天", "雨", "。")
+W = ((1.0,-.3,.2), (-.2,.9,.1), (.1,.2,.8), (-.4,-.2,.6))
+def softmax(xs):
+    m=max(xs); e=[exp(x-m) for x in xs]
+    return [x/sum(e) for x in e]
+def top2(h):
+    z=[sum(w*x for w,x in zip(row,h)) for row in W]
+    return [x for _,x in sorted(zip(softmax(z),VOCAB),reverse=True)[:2]]
+def predict(h, previous):
+    bias=[.08*(VOCAB.index(previous)+1),0,-.03]
+    return [.85*x+b for x,b in zip(h,bias)]
+h=[.4,.6,.2]; first=top2(predict(h,"春"))
+print({x: top2(predict(h,x)) for x in first})
+```
+
+## 工程权衡
+
+EAGLE 需要访问目标特征，因此权重版本、层号、hidden size、tokenizer 和推理实现必须匹配。树验证要求专门的 attention mask、位置 id 和 cache 索引；错误的分支隔离会让一个候选泄漏到另一个候选。较高接受率常减少目标轮次，但树展开会增加单轮计算与内存压力。先测每轮接受 token 数、草稿时间、验证时间、显存和端到端 p50/p99，再选择树预算；不要把论文特定配置的倍数套到本地模型。
+
+### 训练信号与部署边界
+
+特征回归损失和 token 预测损失服务不同目的：前者让 $\hat h$ 靠近目标网络真实的隐藏轨迹，后者要求这个特征经词表头仍能提出有用 token。只优化 hidden 的均方误差并不保证 top-k 排序好，反之只蒸馏 token 概率又会削弱特征级的归纳偏置。训练样本还应覆盖推理中草稿自身产生的历史，否则 teacher-forcing 下看见的干净前缀与测试时的候选前缀不一致。EAGLE-3 对这一训练—测试差异的处理，是它不能被简单概括为“多取几层 hidden state”的原因。
+
+目标模型升级后，即便词表看起来相同，隐藏空间的坐标系也可能已经改变；旧草稿器的 $D_\theta$ 输出再经新目标头解释，没有可依赖的含义。量化、layernorm 实现、RoPE 缩放或 chat template 改动也会改变输入轨迹。部署前至少对固定提示集比较草稿 top-k 覆盖率、目标接受长度和输出分布；如果只测短问答，树在长上下文下的 cache 压力会被漏掉。EAGLE 是紧耦合优化，换来较高质量候选，也相应牺牲了随意插拔性。
+
+### 树验证的 shape 检查
+
+将树展平后，节点数记为 $N$，一次验证通常得到 `[N, vocab]` logits，而 attention mask 是 `[N,N]` 或可广播的 batch 形式。节点 $u$ 应只看根到 $u$ 的祖先，不应看同层兄弟或另一分支的后代；position id 必须等于其深度加原前缀长度，而不是展平数组下标。cache 也需要按树父子关系 gather/scatter。一个很实用的单元测试是人为建两条不同分支，改变左分支末 token 后确认右分支 logits 完全不变；若改变了，mask 或 cache 索引有泄漏。
+
+### 阅读结果时的尺度
+
+论文中的 latency speedup、throughput 与接受长度是不同指标。树越宽，单请求可在一次目标调用覆盖更多候选，吞吐却可能因 token 总数和显存变差；树越深，命中时提交更长，错在前部时浪费也更大。选择配置应受服务的首 token 延迟、交互 SLA、平均输出长度与并发数共同约束。将 EAGLE、EAGLE-2、EAGLE-3 的数字直接并列时，至少检查目标模型、解码设置、tree size 和测量口径是否相同。
+
+从使用者角度，EAGLE 最适合被看作目标模型的一个推理附件，而不是可单独替换的通用聊天模型。它输出候选的价值取决于目标特征是否仍然是训练时的特征；当服务需要频繁热更新多个目标 checkpoint，维护多个配套草稿器的存储、加载和回归测试成本也应计入选择。对于不能访问模型中间层的闭源 API，EAGLE 的核心接口天然不可用，此时应考虑只依赖 token 输出的其他方案。
+
+验收时可先关掉树扩展，只验证单路径特征草稿是否提高接受率；再逐步增加宽度和深度。这样能把“草稿质量不足”与“树 mask、cache 或调度错误”分离，也让性能调参有可解释的基线。
+
+## 自测
+
+1. EAGLE 首先预测什么？
+
+<details>
+<summary>答案</summary>
+
+目标模型内部特征，再经词表头得到 token 候选。
+
+</details>
+
+2. 动态树改变接受/残差规则吗？
+
+<details>
+<summary>答案</summary>
+
+不改变；它改变候选组织和验证预算。
+
+</details>
+
+3. 为什么需要移位 token？
+
+<details>
+<summary>答案</summary>
+
+为特征续写提供已确定的离散历史，缓解纯特征预测的歧义。
+
+</details>
+
+## 原始资料链接
+
+- [EAGLE 原论文（arXiv）](https://arxiv.org/abs/2401.15077)
+- [EAGLE-2 论文（arXiv）](https://arxiv.org/abs/2406.16858)
+- [EAGLE-3 论文（arXiv）](https://arxiv.org/abs/2503.01840)
+- [SafeAILab 官方实现](https://github.com/SafeAILab/EAGLE)

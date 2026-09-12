@@ -1,0 +1,79 @@
+import {DpoLab} from '@site/src/components/AlgorithmLab';
+
+# DPO：直接用偏好对拉开策略概率
+
+## 直觉
+
+DPO 把“训练奖励模型，再用 RL 优化”的两步折叠为一项 pairwise 分类损失。它仍有奖励解释，只是把奖励写成策略相对参考策略的 log 概率比。
+
+## 前置知识与机制推导
+
+KL 正则 RL 的最优策略满足 $r(x,y)=\beta\log\left(\frac{\pi(y\mid x)}{\pi_{ref}(y\mid x)}\right)+c(x)$。代入 Bradley--Terry 并消去 $c(x)$，得到
+
+$$
+L_{DPO}=-\log\sigma\left(\beta[\log\pi(y_w|x)-\log\pi_{ref}(y_w|x)-\log\pi(y_l|x)+\log\pi_{ref}(y_l|x)]\right).
+$$
+
+序列 log-prob 是 token log-prob 的和，必须用同一 chat template、EOS 和 mask。$\beta$ 决定 logistic margin 的尺度；不是奖励的物理单位。DPO 不需要在线 rollout 或 value model，但它依赖固定偏好对能代表所需行为。
+
+## 数据流程
+
+每项为 $(x,y_w,y_l)$，两回复必须对应同一提示；去除编码、模板和长度泄漏。冻结 reference，计算四个序列 log-prob，长度策略应明确（总和会偏好短序列的高概率）。以胜负翻转、held-out prompt 和人工评估检查，而非只报告训练 loss。
+
+## 从 KL 约束到 log-ratio
+
+对固定 $x$，给 $\sum_y\pi(y)=1$ 加拉格朗日乘子 $\lambda$。目标对 $\pi(y)$ 的导数为 $r(y)-\beta[\log(\pi(y)/\pi_{ref}(y))+1]+\lambda=0$，整理得 $\log\left(\pi(y)/\pi_{ref}(y)\right)=r(y)/\beta+C(x)$。将其代入偏好模型 $\sigma(r_w-r_l)$，共同的 $C(x)$ 消失，便得到 DPO 的四个 log-prob 差。这个推导依赖同一 prompt、固定 reference 与 KL 正则最优形式；它不是说任何偏好数据都有无条件闭式解。
+
+手算一对：当前相对 reference 的胜者 log-ratio 是 $-0.4$，败者是 $-0.1$，则 log-ratio gap 是 $-0.3$，margin 为 $\beta(-0.3)$；若 $\beta=0.2$，它为 $-0.06$，loss 大于 $\log2$，更新会提高胜者的相对量、降低败者的相对量。由最优关系定义的隐式奖励差正是这个 margin，而非未乘 $\beta$ 的 log-ratio gap。注意“提高相对量”不等价于 chosen 的绝对概率必增：softmax 归一化、共享参数和其他样本的梯度可使 chosen 的绝对 log-prob 在某步下降，只要 rejected 下降更多或 reference-relative gap 增大。应监控 chosen/rejected log-prob、margin、KL 与长度，而不是把 chosen likelihood 当成唯一健康指标。
+
+## 小例子
+
+```python
+"""两动作离散策略的一次 DPO 更新；不是实际 LLM。"""
+import math
+def sigmoid(x): return 1 / (1 + math.exp(-x))
+def loss_and_grad(logit_gap, ref_gap, beta):
+    margin = beta * (logit_gap - ref_gap)
+    loss = math.log1p(math.exp(-margin))
+    return loss, -beta * sigmoid(-margin), margin
+logit_gap, ref_gap, beta = -0.4, -0.1, .2
+before, grad, margin_before = loss_and_grad(logit_gap, ref_gap, beta)
+updated = logit_gap - .8 * grad
+after, _, margin_after = loss_and_grad(updated, ref_gap, beta)
+print("before", round(before, 4), "margin", round(margin_before, 3))
+print("after ", round(after, 4), "margin", round(margin_after, 3))
+assert after < before and margin_after > margin_before
+```
+
+运行 `python examples/alignment/dpo.py` 会打印更新前后 loss 和隐式奖励差，并断言 loss 下降、margin 上升。这是两动作离散策略，不是实际 LLM；它只展示单个偏好对怎样给 log-ratio 差施加梯度。 [下载示例](../../examples/alignment/dpo.py)
+
+## 交互实验：偏好信号实验
+
+<DpoLab />
+
+## 常见误区
+
+DPO 省掉显式 RM，不会省掉偏好噪声、分布偏移或奖励投机。把不同提示的回答配成一对破坏比较假设；盲目增大 $\beta$ 会使少数冲突标签产生过大更新。
+
+## 序列对数概率的实现边界
+
+写作 $\log\pi(y|x)$ 时实际是有效 assistant token 的和，而不是平均值；chosen 与 rejected 应各自保留 EOS，且都从相同 prompt 边界开始。若 tokenizer 或 template 不同，四项相减会混入格式概率。长度归一化会改变 DPO 偏好的对象：它不再是完整回复的概率比，而是每 token 几何平均概率比；可以使用，但必须和数据的长度偏好、评测及 reference 计算保持一致。
+
+## 自测问题
+
+1. reference 为什么出现两次？
+2. 何时 DPO 不如在线方法？
+3. $c(x)$ 为何消失？
+
+<details>
+<summary>答案</summary>
+
+1. 比较胜败各自相对参考的变化。
+2. 需要探索新回答或偏好随策略变化时。
+3. 同一 prompt 的奖励常数在差中抵消。
+
+</details>
+
+## 原始参考资料
+
+- [Direct Preference Optimization](https://arxiv.org/abs/2305.18290)

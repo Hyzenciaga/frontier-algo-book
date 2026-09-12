@@ -1,0 +1,203 @@
+# τ-bench：Agent 能否稳定地把事情办成？
+
+import PassMetricsLab from '@site/src/components/PassMetricsLab';
+
+τ-bench（Tool–Agent–User Interaction Benchmark）把评测单位设为一场服务对话：Agent 一边向模拟客户追问信息，一边查规则、调用工具，最后接受环境状态检查。本章讨论 **2024 年原始 τ-bench**，将任务定义、评分实现与统计指标放在同一条链路中阅读。[原始论文](https://arxiv.org/abs/2406.12045)
+
+## 1. 考察什么：从回答问题到完成事务
+
+“已为您退货”是一句话，退货申请确实写入正确订单才是结果。τ-bench 同时考察三类能力：从对话中获取缺失信息、根据业务规则作决策、把决策转成正确的工具操作。开放的是交互过程；受约束的是业务规则和目标状态。
+
+| 能力 | Agent 需要做什么 | 常见失败 |
+| --- | --- | --- |
+| 信息获取 | 追问目标、定位账户和订单、确认偏好 | 没问清就执行，遗漏条件 |
+| 规则推理 | 结合订单状态、商品属性、支付和退改规则 | 工具能调用，就误以为业务允许 |
+| 多步执行 | 查询候选、比较方案、提交正确参数 | 商品编号混淆、修改错误订单 |
+| 复合请求 | 同时处理咨询与变更，跟踪意图更新 | 只完成其中一半 |
+| 可靠性 | 面对同一任务的不同对话走向仍成功 | 偶尔成功，重复运行频繁失败 |
+
+这些是对原始评测结构的能力拆解，不是五个独立的官方子分数。不能只看一项最终成功率，就认为五项能力均已解决。[作者介绍](https://sierra.ai/resources/research/tau-bench)
+
+## 2. 数据集：一题到底长什么样？
+
+### 任务包，而非静态问答对
+
+每题包含客户模拟器的隐藏指令、初始数据库、可用工具、领域规则，以及评测端的参考操作和必要输出。Agent 读取规则和工具说明，通过工具取得数据；不能直接读取隐藏目标。每次试验应从同一初始状态重置，对话则可能变化。
+
+```text
+隐藏客户指令 → 客户模拟器 ⇄ Agent ⇄ API ⇄ 数据库
+                              ↑
+                           领域规则
+
+评测端：初始数据库 + 参考操作 → 目标数据库
+        实际最终数据库 ↔ 目标数据库
+        回复内容是否覆盖必要输出
+```
+
+经典测试集包括 **115 个 retail 任务和 50 个 airline 任务**。这里统计的是下方固定版本的测试任务列表，不包含训练/开发拆分，也不把每次重跑当成新题。[Retail 测试定义](https://github.com/sierra-research/tau-bench/blob/59a200c6d575d595120f1cb70fea53cef0632f6b/tau_bench/envs/retail/tasks_test.py)、[Airline 测试定义](https://github.com/sierra-research/tau-bench/blob/59a200c6d575d595120f1cb70fea53cef0632f6b/tau_bench/envs/airline/tasks_test.py)
+
+### 官方任务的中文释义
+
+以下是源文件中任务指令与标注的节选释义，保留决定题型的条件，省略身份和编号。**不是逐字原题，也不是模型一开始就能看到的完整提示**。编号按源文件任务列表从 0 开始计数。
+
+<p className="table-scroll-hint">左右滑动查看完整任务表。</p>
+
+<div className="task-table" role="region" aria-label="官方任务样例，可横向滚动" tabIndex={0}>
+
+| 任务 / 来源 | 任务大意与关键条件 | 题型 | 标注要求体现在哪里 |
+| --- | --- | --- | --- |
+| [Retail 0](https://github.com/sierra-research/tau-bench/blob/59a200c6d575d595120f1cb70fea53cef0632f6b/tau_bench/envs/retail/tasks_test.py#L4) | 更换键盘和温控器；键盘有属性要求，允许按条件退让；温控器改为兼容 Google Home | 多条件换货，开放交互 + 工具操作 | 一次换货操作包含两个匹配的商品变体 |
+| [Retail 1](https://github.com/sierra-research/tau-bench/blob/59a200c6d575d595120f1cb70fea53cef0632f6b/tau_bench/envs/retail/tasks_test.py#L28) | 与上一题接近，但键盘属性不满足就只换温控器 | 条件分支，开放交互 + 工具操作 | 参考操作只更换温控器；忽视一句偏好就会写错 |
+| [Retail 2](https://github.com/sierra-research/tau-bench/blob/59a200c6d575d595120f1cb70fea53cef0632f6b/tau_bench/envs/retail/tasks_test.py#L52) | 查询 T 恤选项数量，并退掉清洁器、耳机和手表 | 信息查询 + 多物品退货 | 数据库变更之外，回复还须覆盖数量信息 |
+| [Airline 0](https://github.com/sierra-research/tau-bench/blob/59a200c6d575d595120f1cb70fea53cef0632f6b/tau_bench/envs/airline/tasks_test.py#L4) | 预订纽约到西雅图的经济舱；限制出发时间，比较直飞/转机与价格，并处理行李和凭证支付 | 约束满足 + 预订事务 | 航段、支付金额、行李和保险等参数共同决定结果 |
+| [Airline 1](https://github.com/sierra-research/tau-bench/blob/59a200c6d575d595120f1cb70fea53cef0632f6b/tau_bench/envs/airline/tasks_test.py#L36) | 想改晚些返回 Newark，不能换成 JFK；基本经济舱不能改时愿意按指定条件取消 | 规则推理 + 备选方案 | 参考结果为取消原预订，而非勉强执行改签 |
+| [Airline 2](https://github.com/sierra-research/tau-bench/blob/59a200c6d575d595120f1cb70fea53cef0632f6b/tau_bench/envs/airline/tasks_test.py#L45) | 将全部商务舱降为经济舱，保持航班和旅客不变，并说明节省总额 | 多记录更新 + 数值汇总 | 多个预订都要更新，并覆盖要求的金额输出 |
+
+</div>
+
+**它不是选择题，也不是判断题。** 模型输出自然语言消息与结构化 API 参数，评测器再把最终结果判成成功/失败。二元评分不等于二元题型；任务中的“如果不行就选另一方案”也不等于提供 A/B/C/D 的静态选择题。
+
+## 3. 怎么判对：回复与数据库必须分开看
+
+固定版本的评分器先取得实际数据库哈希，再从初始数据执行参考操作取得目标哈希。两者不一致就失败；如任务标注了必要输出，还检查这些字符串是否出现在对客户的回复中，匹配前转换大小写并去除回复中的逗号。它不要求查询路径、措辞或全部工具调用序列完全相同。[评分实现](https://github.com/sierra-research/tau-bench/blob/59a200c6d575d595120f1cb70fea53cef0632f6b/tau_bench/envs/base.py#L123)
+
+可以把成功事件写成：
+
+$$
+r = r_{\mathrm{state}}\times r_{\mathrm{output}},\qquad r\in\{0,1\}.
+$$
+
+没有必要输出标注时，输出项不额外限制成功；有标注时，只把状态改对仍不够。相反，一段完整、礼貌的解释也不能补偿错误的数据修改。
+
+但这种自动判分仍有盲区：**目标状态相同不证明全过程合规**，例如未经确认就提交变更；字符串出现也不证明解释在语义上完全正确。最终分数适合检验任务结果，不能替代完整的策略遵循审计。
+
+## 4. 核心指标：pass@k 与 pass^k
+
+### 一个看“找到解”，一个看“始终可靠”
+
+假设同一道题每次独立运行的成功概率是 $p$：
+
+| 指标 | 成功事件 | 单题理论值 | 随 k 增大 |
+| --- | --- | --- | --- |
+| pass@k | k 次中至少一次成功 | $1-(1-p)^k$ | 不下降 |
+| pass^k | k 次全部成功 | $p^k$ | 不上升 |
+| pass@1 = pass^1 | 一次成功 | $p$ | 基线 |
+
+代码生成可以运行测试筛选多个候选，因此“找到一个通过的解”很有价值；执行真实事务时，顾客通常不会接受多次错误操作换来一次成功。τ-bench 用 pass^k 强调后一种可靠性。pass@k 在代码生成评测中的典型来源是 HumanEval/Codex 论文；它并非 τ-bench 新提出的指标。[HumanEval/Codex 论文](https://arxiv.org/abs/2107.03374)
+
+这里的 k 次指独立重置的评测 episode，**不是允许 Agent 在同一场对话里重试 k 次工具调用**。独立同分布是假设：更换模型版本或模拟器、延续上一次数据库状态、跨次共享记忆，都会改变解释。
+
+### 为什么用组合数估计？
+
+实际只观测到 $n$ 次运行中有 $c$ 次成功。从这些结果里等概率抽取 k 个不同试验，总共有 $\binom{n}{k}$ 个子集：
+
+- 全部成功的子集只能从 c 次成功里挑，数量为 $\binom{c}{k}$。
+- 至少一次成功等价于“不是全部失败”；全部失败子集数量为 $\binom{n-c}{k}$。
+
+所以对第 i 道题：
+
+$$
+\widehat{\operatorname{pass}^{k}}_i =
+\frac{\binom{c_i}{k}}{\binom{n_i}{k}},
+\qquad
+\widehat{\operatorname{pass@k}}_i =
+1-\frac{\binom{n_i-c_i}{k}}{\binom{n_i}{k}}.
+$$
+
+要求 $1\le k\le n_i$；当可选的成功或失败次数小于 k，对应组合数为 0。在独立同分布采样下，组合估计是无偏的；直接将经验成功率 $c/n$ 代入幂函数通常有有限样本偏差。这里的“无偏”指重复采集整组样本后的期望，不是保证当前估计已经精准。
+
+例如 `n=10, c=7, k=3`，pass@3 为 `119/120 ≈ 99.17%`，pass^3 为 `35/120 ≈ 29.17%`。同一批结果可以同时呈现很强的多次解题能力和很弱的连续可靠性。
+
+### 交互计算
+
+<PassMetricsLab />
+
+### 多题汇总不能先混在一起
+
+先按题计算指标，再对 M 道题取平均：
+
+$$
+\widehat P=\frac{1}{M}\sum_{i=1}^{M}\widehat P_i.
+$$
+
+不要把所有成功次数相加、得到一个总体 p，再计算 $p^k$。反例：两题真实成功率分别为 0 和 1，pass^2 的题均值是 0.5；先平均得到 0.5 再平方却是 0.25。差异来自题目难度的异质性。
+
+报告还应注明按题平均还是按领域平均：两个领域任务数不同时，这两种权重会产生不同总分。k 较大时全成功更罕见，估计方差也可能更显著；应同时报告 n、各题结果及不确定性，不能只展示一条光滑曲线。
+
+## 5. 代码：复算一组评测记录
+
+以下代码只做指标汇总，不调用模型，不是 τ-bench 官方成绩。三个列表分别代表三个任务的独立运行结果，每次开始前环境都已重置。可下载 [完整 Python 示例](../../examples/benchmarks/tau-bench.py) 后直接运行。
+
+```python
+from math import comb
+
+
+def metrics(results, k):
+    n, c = len(results), sum(results)
+    if not 1 <= k <= n:
+        raise ValueError("k must be between 1 and number of trials")
+    denom = comb(n, k)
+    return (1 - comb(n - c, k) / denom, comb(c, k) / denom)
+
+
+tasks = [
+    [1, 1, 0, 1, 1, 0, 1, 1, 0, 1],
+    [1] * 10,
+    [0] * 10,
+]
+for k in [1, 3, 5]:
+    scores = [metrics(task, k) for task in tasks]
+    at_k = sum(s[0] for s in scores) / len(scores)
+    all_k = sum(s[1] for s in scores) / len(scores)
+    print(f"k={k}: pass@k={at_k:.4f}, pass^k={all_k:.4f}")
+
+assert metrics([1] * 10, 3) == (1.0, 1.0)
+assert metrics([0] * 10, 3) == (0.0, 0.0)
+```
+
+预期输出依次为 `(0.5667, 0.5667)`、`(0.6639, 0.4306)`、`(0.6667, 0.3611)`。可将同样的计算用于固定协议下的其他二元成功事件；前提是先弄清楚每个 0/1 怎样产生。
+
+## 6. 怎样读一份 τ-bench 结果？
+
+| 必须核对的设置 | 原因 |
+| --- | --- |
+| 任务与规则的固定版本 | 标注修复会改变“正确”的目标状态 |
+| Agent 模型、提示、工具接口与采样参数 | 分数属于整个 Agent 配置，不只属于基础模型 |
+| 客户模拟器与采样设置 | 问法、信息披露、确认路径都会影响难度 |
+| 每题试验次数 n 与指标 k | k 大于 n 无法计算上述组合估计 |
+| 每轮工具预算、终止规则和错误处理 | 超时、截断、失败记录丢失会影响分母 |
+| 运行隔离与汇总权重 | 跨次状态污染或不同领域加权会破坏可比性 |
+
+从失败轨迹反查能力：是没获取条件，还是规则读错，还是参数/工具出错？用这个分解连接 [Agentic RL](../agents/agentic-rl.mdx) 的奖励设计与 [ACE](../agents/ace.mdx) 的经验更新，比单纯追总分更能指导改进。训练和调参使用的任务必须与最终验收分开。
+
+## 7. 版本与评测边界
+
+本章以原始 τ-bench 的 retail / airline 为教学对象。官方旧仓库现已提示任务版本过时，并指向后继 τ³-bench（沿用 tau2-bench 仓库路径）的修订任务。**复现经典论文时固定历史版本；开展新的模型横评时，先确认目标版本。** 不把 τ-bench、τ²-bench、τ³-bench 的成绩放在同一列直接比较。[官方版本说明](https://github.com/sierra-research/tau-bench)
+
+模拟客户不等于真实人群，合成业务环境也不代表全部线上流程。较高的 pass^k 是特定任务分布与协议下的一致性证据，不是无限次运行不会出错的承诺。
+
+## 自测
+
+1. 模型生成“退款成功”，但数据库未变，应怎样判分？
+2. 十次成功七次，为什么 pass@3 与 pass^3 相差这么大？
+3. 为什么不能先算全体任务平均成功率，再取三次方？
+4. 状态检查通过，是否意味着没有绕过确认规则？
+
+<details>
+<summary>参考答案</summary>
+
+1. 状态项未达标，任务失败；回复不能代替事务执行。
+2. 两者的成功事件不同：至少一次成功的组合有 119 个，三次全成功的只有 35 个，总数都是 120。
+3. 题目成功概率不同，非线性变换与平均不能交换。
+4. 不意味着；最终状态检查无法覆盖全部过程规则，需要额外的轨迹审计。
+
+</details>
+
+## 附件与原始资料
+
+- [τ-bench 论文](https://arxiv.org/abs/2406.12045)、[原始 v1 全文](https://arxiv.org/html/2406.12045v1)
+- [官方代码与数据](https://github.com/sierra-research/tau-bench/tree/59a200c6d575d595120f1cb70fea53cef0632f6b) · 本章样例与评分实现固定在提交 `59a200c`
+- [官方 pass^k 汇总代码](https://github.com/sierra-research/tau-bench/blob/59a200c6d575d595120f1cb70fea53cef0632f6b/tau_bench/run.py#L194)
+- [HumanEval/Codex：Evaluating Large Language Models Trained on Code](https://arxiv.org/abs/2107.03374)
+
+[返回 评测体系](/benchmarks)

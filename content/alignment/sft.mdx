@@ -1,0 +1,74 @@
+# SFT：先学会像示范那样回答
+
+## 直觉
+
+监督微调把“理想答复”作为条件分布的样本。它不是答案检索：共享参数会让一个示范的梯度影响相似提示，所以聊天模板、系统指令和拒答样式也是学习信号。
+
+## 前置知识与机制推导
+
+对词表大小 $V$ 的 logits $z$，教师强制最小化
+
+$$
+L=-\frac1{|D|}\sum_{i,t}m_{it}\log\operatorname{softmax}(z_{it})[y_{it}].
+$$
+
+$m$ 屏蔽 padding 和不应预测的提示 token。单位置梯度是 $\partial L/\partial z_j=p_j-\mathbb1[j=y^*]$：正确 token 上升，其余按当前概率下降。训练喂入正确前缀、推理喂入自己生成的前缀，错误会累积，这正是 exposure bias。
+
+## 数据流程
+
+先写可执行 rubric，再收集多轮示范与安全拒答；统一模板，仅给 assistant token 置 mask。按提示去重和切分，避免同一题的变体跨训练/验证。验证同时看 NLL、格式、盲评和风险切片。高质量但相互矛盾的示范会把同一条件推向不同方向。
+
+## shifted labels、padding 与分母
+
+自回归模型位置 $t$ 的输入是前缀，标签应是下一 token：输入 `[BOS, 我, 爱, 猫]` 的 label 是 `[我, 爱, 猫, EOS]`，实现中通常将 logits 丢掉末位、labels 丢掉首位。这不是排版细节；不 shift 会训练模型在看到 `爱` 时再预测 `爱`。若 batch 把两样本补成长度 5，mask 分别为 $(1,1,1,0,0)$ 和 $(1,1,1,1,1)$，正确平均是八个有效 token 的 loss 和除以 8，而不是除以 10。否则短样本越多，padding 越会稀释梯度。
+
+多轮对话还要区分 attention mask 与 loss mask：前者让 padding 不参与注意力，后者决定哪个位置有监督。prompt mask 为零并不表示模型“看不见”用户问题；它仍可作为 attention 的条件，只是不被要求复述。一个手算 batch：assistant 三个 token 的 NLL 为 $(0.2,1.0,0.4)$，另一条两个 token 为 $(0.8,0.6)$，平均为 $3.0/5=0.6$；若错误除以含 padding 的 8，得到 $0.375$，训练曲线会虚假变好。
+
+## 小例子
+
+```python
+"""离散三词策略的 SFT 梯度下降；不是实际 LLM。"""
+import math
+def step(logits, target, lr):
+    z = sum(math.exp(x) for x in logits)
+    p = [math.exp(x) / z for x in logits]
+    loss = -math.log(p[target])
+    grad = [q - (i == target) for i, q in enumerate(p)]
+    return [x - lr * g for x, g in zip(logits, grad)], loss, p
+logits, target = [1.0, 0.0, -1.0], 0
+updated, before, p_before = step(logits, target, .5)
+_, after, p_after = step(updated, target, 0.0)
+print("before", round(before, 3), [round(x, 3) for x in p_before])
+print("after ", round(after, 3), [round(x, 3) for x in p_after])
+assert after < before
+```
+
+运行 `python examples/alignment/sft.py` 会打印更新前后的 loss 与概率，并断言 loss 下降。这是小型离散策略，真实 LLM 会对大量 token 和参数做同样的向量化计算。 [下载示例](../../examples/alignment/sft.py)
+
+## 常见误区
+
+低 NLL 只衡量同分布复现；它不验证事实性。一个等价答案被选为唯一标签会压缩合理表达。SFT 能迁移格式与行为模式，不能凭空补全分布外知识。
+
+## token 平均与序列平均是不同目标
+
+token reduction 给每个有效 token 同权，一条 100 token 回复的总影响约为 10 token 回复的十倍；sequence reduction 先在每条回复内平均，再平均样本，令每个样本总权重相同。前者适合估计语言分布，后者可防长回复主导任务权重，但会放大短答的单 token 影响。无论选哪一个，训练日志、梯度累积和验证 loss 必须采用同一约定，否则数值不能横向比较。
+
+## 自测问题
+
+1. 为什么 prompt token 通常 mask？
+2. 为什么低 NLL 不保证上线质量？
+3. 两个等价答案只保留一个的风险？
+
+<details>
+<summary>答案</summary>
+
+1. 它是条件，而非训练要预测的目标。
+2. 部署分布和目标更宽。
+3. 模型把合理变体当作较低概率事件。
+
+</details>
+
+## 原始参考资料
+
+- [InstructGPT：示范阶段](https://arxiv.org/abs/2203.02155)
+- [CrossEntropyLoss](https://pytorch.org/docs/stable/generated/torch.nn.CrossEntropyLoss.html)

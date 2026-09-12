@@ -20,5 +20,9 @@ const sidebars: SidebarsConfig = {
     {type: 'link', label: '← 论文目录', href: '/papers'},
     {type: 'category', label: '模型架构', collapsed: false, items: ['papers/attention-is-all-you-need']},
   ],
+  benchmarks: [
+    {type: 'link', label: '← Benchmark 目录', href: '/benchmarks'},
+    {type: 'category', label: 'Agent 交互与可靠性', collapsed: false, items: ['benchmarks/tau-bench']},
+  ],
 };
 export default sidebars;

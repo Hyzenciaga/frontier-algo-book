@@ -28,7 +28,7 @@ export default function Home() {
       </header>
       <section className="route-section" aria-labelledby="route-title"><div className="section-title"><div><span className="eyebrow">YOUR LEARNING PATH</span><h2 id="route-title">四个主题，一条清晰的起点。</h2></div><Link to="/learn/roadmap">查看前置知识与依赖 →</Link></div><LearningMap/></section>
       <section className="lab-banner"><div className="lab-symbol" aria-hidden="true">01</div><div><span className="eyebrow">READ THE ORIGINAL</span><h2>从 Transformer 的第一篇论文读起。</h2><p>Attention Is All You Need · 原文、阅读顺序与知识点讲解。</p></div><Link className="button button--secondary" to="/learn/papers/attention-is-all-you-need">阅读 Transformer →</Link></section>
-      <p className="edition-note">首版学习笔记 · 持续补充推导与复现实验。各章附原始资料；名称或定义存疑时会在正文标明。</p>
+      <p className="edition-note">理解机制，推导公式，运行代码。交互示范与原始论文随知识点展开。</p>
     </main>
   </Layout>;
 }

@@ -2,40 +2,73 @@
 
 ## 直觉
 
-监督微调（Supervised Fine-Tuning，SFT）用“提示—理想回答”对，把预训练模型从续写互联网文本拉到遵循指令的起点。它通常是后续偏好优化的底座，而非“人类反馈强化学习”的同义词。InstructGPT 的流程先收集标注员示范并做 SFT，再收集多个模型回答的排序供后续阶段使用。
+监督微调把“理想答复”作为条件分布的样本。它不是答案检索：共享参数会让一个示范的梯度影响相似提示，所以聊天模板、系统指令和拒答样式也是学习信号。
 
-## 前置知识
+## 前置知识与机制推导
 
-模型把回答拆成 token，教师强制（teacher forcing）下每一步都以真实历史 token 为条件。损失是交叉熵的简化式：
+对词表大小 $V$ 的 logits $z$，教师强制最小化
 
-```
-L = - Σ_(x,y*) Σ_t log πθ(y*_t | x, y*_<t)
-```
+$$
+L=-\frac1{|D|}\sum_{i,t}m_{it}\log\operatorname{softmax}(z_{it})[y_{it}].
+$$
 
-最小化它等于提高示范序列的条件概率。数据可来自人工撰写、专家流程、合成后审校或工具执行轨迹；来源不同，决定了“理想”的含义与偏差。训练时常从预训练模型开始，验证集要覆盖真实提示分布和安全边界。
+$m$ 屏蔽 padding 和不应预测的提示 token。单位置梯度是 $\partial L/\partial z_j=p_j-\mathbb1[j=y^*]$：正确 token 上升，其余按当前概率下降。训练喂入正确前缀、推理喂入自己生成的前缀，错误会累积，这正是 exposure bias。
 
-## 流程
+## 数据流程
 
-1. 定义任务与可接受行为，收集代表性提示。
-2. 为每个提示准备可审查的目标回答，并清理冲突、隐私和低质量样本。
-3. token 化、计算交叉熵、更新参数，保留验证集与基线。
-4. 用人工评审、任务正确率、拒答质量等检查，而不是只看训练损失。
+先写可执行 rubric，再收集多轮示范与安全拒答；统一模板，仅给 assistant token 置 mask。按提示去重和切分，避免同一题的变体跨训练/验证。验证同时看 NLL、格式、盲评和风险切片。高质量但相互矛盾的示范会把同一条件推向不同方向。
+
+## shifted labels、padding 与分母
+
+自回归模型位置 $t$ 的输入是前缀，标签应是下一 token：输入 `[BOS, 我, 爱, 猫]` 的 label 是 `[我, 爱, 猫, EOS]`，实现中通常将 logits 丢掉末位、labels 丢掉首位。这不是排版细节；不 shift 会训练模型在看到 `爱` 时再预测 `爱`。若 batch 把两样本补成长度 5，mask 分别为 $(1,1,1,0,0)$ 和 $(1,1,1,1,1)$，正确平均是八个有效 token 的 loss 和除以 8，而不是除以 10。否则短样本越多，padding 越会稀释梯度。
+
+多轮对话还要区分 attention mask 与 loss mask：前者让 padding 不参与注意力，后者决定哪个位置有监督。prompt mask 为零并不表示模型“看不见”用户问题；它仍可作为 attention 的条件，只是不被要求复述。一个手算 batch：assistant 三个 token 的 NLL 为 $(0.2,1.0,0.4)$，另一条两个 token 为 $(0.8,0.6)$，平均为 $3.0/5=0.6$；若错误除以含 padding 的 8，得到 $0.375$，训练曲线会虚假变好。
 
 ## 小例子
 
-给定“把下列三点整理成表格”，示范答案包含 Markdown 表、没有杜撰条目。重复这类样本会让模型更常输出表格格式。但若所有示范都过度冗长，它也会学会冗长；SFT 会模仿数据分布，不会自动识别产品意图。
+```python
+"""离散三词策略的 SFT 梯度下降；不是实际 LLM。"""
+import math
+def step(logits, target, lr):
+    z = sum(math.exp(x) for x in logits)
+    p = [math.exp(x) / z for x in logits]
+    loss = -math.log(p[target])
+    grad = [q - (i == target) for i, q in enumerate(p)]
+    return [x - lr * g for x, g in zip(logits, grad)], loss, p
+logits, target = [1.0, 0.0, -1.0], 0
+updated, before, p_before = step(logits, target, .5)
+_, after, p_after = step(updated, target, 0.0)
+print("before", round(before, 3), [round(x, 3) for x in p_before])
+print("after ", round(after, 3), [round(x, 3) for x in p_after])
+assert after < before
+```
+
+运行 `python examples/alignment/sft.py` 会打印更新前后的 loss 与概率，并断言 loss 下降。这是小型离散策略，真实 LLM 会对大量 token 和参数做同样的向量化计算。 [下载示例](../../examples/alignment/sft.py)
 
 ## 常见误区
 
-“SFT 只需问答对”不准确：多轮上下文、系统约束、工具调用的输入与输出边界都必须编码进样本。也不要把单一标准答案当唯一真相；开放问题可有多个合格回答。SFT 也不是奖励模型：它直接拟合被选中的文本，不学习两个候选之间的相对偏好。
+低 NLL 只衡量同分布复现；它不验证事实性。一个等价答案被选为唯一标签会压缩合理表达。SFT 能迁移格式与行为模式，不能凭空补全分布外知识。
+
+## token 平均与序列平均是不同目标
+
+token reduction 给每个有效 token 同权，一条 100 token 回复的总影响约为 10 token 回复的十倍；sequence reduction 先在每条回复内平均，再平均样本，令每个样本总权重相同。前者适合估计语言分布，后者可防长回复主导任务权重，但会放大短答的单 token 影响。无论选哪一个，训练日志、梯度累积和验证 loss 必须采用同一约定，否则数值不能横向比较。
 
 ## 自测问题
 
-1. 为什么 SFT 的训练损失下降不能单独证明更有帮助？
-2. 一个工具调用轨迹中，哪些内容应作为模型目标 token？
-3. SFT 数据的文风偏差会怎样传给后续 RL？
+1. 为什么 prompt token 通常 mask？
+2. 为什么低 NLL 不保证上线质量？
+3. 两个等价答案只保留一个的风险？
+
+<details>
+<summary>答案</summary>
+
+1. 它是条件，而非训练要预测的目标。
+2. 部署分布和目标更宽。
+3. 模型把合理变体当作较低概率事件。
+
+</details>
 
 ## 原始参考资料
 
-- [Ouyang 等，InstructGPT 论文](https://arxiv.org/abs/2203.02155)
-- [InstructGPT 论文 PDF](https://arxiv.org/pdf/2203.02155)
+- [InstructGPT：示范阶段](https://arxiv.org/abs/2203.02155)
+- [CrossEntropyLoss](https://pytorch.org/docs/stable/generated/torch.nn.CrossEntropyLoss.html)

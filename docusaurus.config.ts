@@ -1,5 +1,7 @@
 import type {Config} from '@docusaurus/types';
 import type {Options, ThemeConfig} from '@docusaurus/preset-classic';
+import remarkMath from 'remark-math';
+import rehypeKatex from 'rehype-katex';
 
 const config: Config = {
   title: '前沿算法手册',
@@ -13,9 +15,9 @@ const config: Config = {
   onBrokenLinks: 'throw',
   i18n: {defaultLocale: 'zh-Hans', locales: ['zh-Hans']},
   presets: [['classic', {
-    docs: {path: 'content', routeBasePath: 'learn', sidebarPath: './sidebars.ts'},
+    docs: {path: 'content', routeBasePath: 'learn', sidebarPath: './sidebars.ts', remarkPlugins: [remarkMath], rehypePlugins: [rehypeKatex]},
     blog: false,
-    theme: {customCss: './src/css/custom.css'},
+    theme: {customCss: ['./node_modules/katex/dist/katex.min.css', './src/css/custom.css']},
   } satisfies Options]],
   themeConfig: {
     colorMode: {defaultMode: 'light', respectPrefersColorScheme: false},
@@ -24,6 +26,7 @@ const config: Config = {
       items: [
         {to: '/learn/roadmap', label: '学习路线', position: 'left'},
         {to: '/papers', label: '论文目录', position: 'left'},
+        {to: '/benchmarks', label: 'Benchmark', position: 'left'},
         {href: 'https://github.com/Hyzenciaga/frontier-algo-book', label: 'GitHub', position: 'right'},
       ],
     },

@@ -1,6 +1,6 @@
 # 前沿算法手册 · Frontier Algo Book
 
-面向自学者的中文学习手册：从 SFT、偏好对齐和强化学习，到 Agent 学习与投机解码。首版包含 **15 篇主题章节 + Transformer 导读 + 学习路线 + 3 个章节内实验**。正文附原始资料，并注明术语不确定性及教学简化。
+面向自学者的中文学习手册：从 SFT、偏好对齐和强化学习，到 Agent 学习与投机解码。包含 **15 篇主题章节、Transformer 导读、τ-bench 详解、学习路线和 4 个章节内实验**，配套 **17 个 Python 教学示例**。正文提供机制推导、可运行代码、自测与原始资料。
 
 ## 技术选择
 
@@ -22,6 +22,7 @@ npm start
 ```bash
 npm run typecheck
 npm test
+npm run check:examples  # 需要 Python 3.10+
 npm run build
 npm run serve
 ```
@@ -35,16 +36,18 @@ npm run serve
 - 蒸馏与 Agent 学习：OPD、ACE、Agentic RL、RSI。
 - 推理加速：投机解码、EAGLE、DFlash、DSpark。
 
-推荐顺序及依赖表在 `content/roadmap.mdx`。`ego` 暂按 EAGLE 理解，但未获用户确认；OPD 采用 On-Policy Distillation，ACE 采用 Agentic Context Engineering。DSpark 已核验论文和 DeepSeek 官方 DeepSpec。
+推荐顺序及依赖表在 `content/roadmap.mdx`。OPD 指 On-Policy Distillation，ACE 指 Agentic Context Engineering；EAGLE、DFlash、DSpark 分别介绍不同的投机解码机制。
 
 ## 项目结构与扩写
 
 ```text
 content/                 MDX 章节与学习路线
 src/components/          可复用交互实验与路线组件
-src/lib/labMath.ts       教学实验计算
-src/pages/              首页、论文目录
-src/data/papers.ts       论文目录条目
+src/lib/                教学实验与评测指标计算
+src/pages/              首页、论文目录、Benchmark 目录
+src/data/               论文与 Benchmark 目录条目
+examples/               17 个标准库 Python 示例
+scripts/                示例执行检查
 src/css/custom.css      响应式主题
 tests/                  数值性质与边界测试
 docs/                   技术规划、调研记录与验证记录
@@ -55,7 +58,7 @@ docusaurus.config.ts    网站地址、路径和导航
 
 新增章节：在对应 `content/` 子目录新增 `.mdx`，以一级标题开始，再把文档 ID 加到 `sidebars.ts`。文件名就是 URL 的一部分，请保持稳定。内部章节链接优先使用相对 `.mdx` 链接，以便构建时检查。
 
-交互实验只放在对应知识章节中，没有独立实验页。论文目录位于 `/papers/`，导读位于 `content/papers/`；新增论文时更新 `src/data/papers.ts` 和 `sidebars.ts` 中的 papers 目录。
+交互实验只放在对应知识章节中，没有独立实验页。论文目录位于 `/papers/`，导读位于 `content/papers/`；新增论文时更新 `src/data/papers.ts` 和 `sidebars.ts` 中的 papers 目录。Benchmark 目录位于 `/benchmarks/`，详解位于 `content/benchmarks/`；新增条目时更新 `src/data/benchmarks.ts` 和相应 sidebar。
 
 正文嵌入 React 实验：
 
@@ -65,7 +68,7 @@ import {DpoLab} from '@site/src/components/AlgorithmLab';
 <DpoLab />
 ```
 
-首版公式使用代码块和 Unicode，尚未引入 LaTeX 排版；如需完整推导，再统一添加 remark-math / rehype-katex。交互实验为教学模型，不调用真实 LLM、不训练参数，也不报告实测加速。
+数学公式使用 remark-math / rehype-katex，KaTeX 字体随站点打包，无需外部 CDN。交互实验为教学模型，不调用真实 LLM、不训练参数，也不报告实测加速。
 
 ## GitHub Pages 上线
 
@@ -73,7 +76,7 @@ import {DpoLab} from '@site/src/components/AlgorithmLab';
 
 1. 在 GitHub 仓库 **Settings → Pages → Build and deployment → Source** 选择 **GitHub Actions**。
 2. 将开发分支通过 PR 合并到 `main`。
-3. `pages.yml` 会安装依赖、运行类型和数值检查、构建并部署。PR 只验证，不发布；从非 main 分支手动触发也只验证。
+3. `pages.yml` 会安装依赖、运行类型、数值和 Python 示例检查、构建并部署。PR 只验证，不发布；从非 main 分支手动触发也只验证。
 4. 在 Actions 查看部署结果。首次部署如提示 environment 分支限制，检查 `github-pages` 环境允许 `main`。
 
 `baseUrl` 已设为 `/frontier-algo-book/`，`trailingSlash: true` 会输出每章的 `index.html`，支持 Pages 子路径和深链接刷新，无需 SPA 404 回退。改仓库名、拥有者或自定义域名时同步修改 `url` / `baseUrl`。

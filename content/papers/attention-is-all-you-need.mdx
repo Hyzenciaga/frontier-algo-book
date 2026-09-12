@@ -2,75 +2,115 @@
 
 **Vaswani 等 · NIPS 2017 · 模型架构**
 
-这是一份入门导读。先理解注意力计算，再沿原文章节深入；它不是完整 Transformer 复现。
+Transformer 的原始论文提出一个 encoder–decoder 翻译模型：编码器把整段源句变成 memory，解码器在每一步读取该 memory 并预测下一个目标 token。今天常见的 decoder-only LLM 沿用了它的注意力积木，却不等同于图 1 的完整架构。理解这一区别，才能同时看懂注意力矩阵、因果 mask、训练并行和生成串行。
 
-## 直觉
+## 前置：从 token 到带位置的表示
 
-读“猫没跳上桌子，因为它太累了”，理解“它”时，需要从上下文取回合适的信息。可以把注意力想成一次查资料：**Q 是查询，K 是索引，V 是索引背后的内容**。模型为不同位置打分，再按权重汇总内容。这是理解计算的比喻，不表示某个头一定学到了代词指代。
+token id 先查 embedding 表，得到 $X\in\mathbb{R}^{n\times d_{model}}$。不含位置的 self-attention 对排列是**等变**的：交换输入两行会相应交换输出两行，因而它本身无法编码“先后”。论文因此加上固定的正余弦位置编码 $PE$：
 
-## 前置知识
+$$
+PE(pos,2i)=\sin(pos/10000^{2i/d_{model}}),\quad PE(pos,2i+1)=\cos(pos/10000^{2i/d_{model}}).
+$$
 
-先理解向量点积、矩阵乘法，以及将一组分数归一化成概率的 softmax。还不熟悉概率与生成时，可以先读[数学基础](../alignment/foundations.mdx)。
+输入是 $X+PE$。不同频率使相对位移可由线性组合表达；这是一种设计动机，不是每个维度都直接存“第几词”。现代变体也会使用学习式位置 embedding、RoPE 或 ALiBi。
 
-## 机制与公式
+## 注意力矩阵与 shape
 
-论文的 Transformer 使用编码器与解码器，用注意力连接序列位置，配合前馈网络、残差连接、归一化与位置编码。原始架构不是仅有一个 attention 层，也不是后来的 decoder-only 架构。
+一个头的投影为 $Q=XW_Q,K=XW_K,V=XW_V$，其中 $W_Q,W_K\in\mathbb{R}^{d_{model}\times d_k}$，$W_V\in\mathbb{R}^{d_{model}\times d_v}$。所以 $Q,K\in\mathbb{R}^{n\times d_k}$、$V\in\mathbb{R}^{n\times d_v}$，而
 
-单头自注意力可拆成四步（`X` 为输入表示）：
+$$
+A=\operatorname{softmax}\left({QK^T\over\sqrt{d_k}}+M\right)\in\mathbb{R}^{n\times n},\qquad O=AV\in\mathbb{R}^{n\times d_v}.
+$$
 
-```text
-Q = X W_Q, K = X W_K, V = X W_V
-S = Q Kᵀ / √d_k
-A = softmax(S)            # 对每个 query 的一行做归一化
-O = A V
-```
+$A_{ij}$ 表示位置 $i$ 的 query 从位置 $j$ 聚合 value 的权重；softmax 对每一行做，故每行和为 1。除以 $\sqrt{d_k}$ 是因为独立、单位方差分量的点积方差约为 $d_k$，缩放可避免 softmax 很早饱和。实际激活不必满足这一简化假设，缩放仍是稳定的工程选择。
 
-若 `Q、K` 的形状为 `n × d_k`，`V` 为 `n × d_v`，则 `S、A` 是 `n × n`，输出是 `n × d_v`。多头使用不同的学习投影，分别计算后拼接，再投影。
+decoder self-attention 的 $M_{ij}$ 在 $j>i$ 时取极小值（概念上 $-\infty$），于是 softmax 后未来权重为零。这是**因果 mask**；padding mask 则遮住补齐的位置，两者用途不同。
 
-### 为什么除以平方根？
+## MHA、FFN 与原始 encoder–decoder
 
-在各分量独立、均值为 0、方差为 1 的简化假设下，`q·k` 的方差为 `d_k`，除以 `√d_k` 后方差为 1。这减轻大分数令 softmax 过于尖锐的问题；不是说真实训练中的向量严格满足该假设。
+多头注意力用 $h$ 组独立投影并行计算 $head_r$，再 $\operatorname{Concat}(head_1,\ldots,head_h)W_O$ 回到 $d_{model}$。头不是把一个矩阵简单切片；每头有自己的可学习 $W_Q,W_K,W_V$，可在不同子空间建立关系。
 
-## 小例子与代码
+每个 encoder 层依次执行非因果 self-attention 和逐位置 FFN，均有残差与 LayerNorm。论文的 FFN 是同一组参数作用于每个位置：$\operatorname{FFN}(x)=\max(0,xW_1+b_1)W_2+b_2$，中间宽度 $d_{ff}$ 增加非线性容量，却不在位置间通信。decoder 层则是 masked self-attention、对 encoder memory 的 cross-attention、FFN：cross-attention 的 $Q$ 来自 decoder，$K,V$ 来自 encoder 输出。原文采用 post-norm；许多后来 LLM 用 pre-norm，不能把两者混作论文原设定。
 
-下面是自编的两位置、单查询计算，只用 Python 标准库。它没有学习投影、多头或完整模型；两条 value 故意采用不同数值，便于观察加权结果。
+## 具体算例：mask 改变一行矩阵
+
+对长度为 3 的 decoder 前缀，未遮罩的第 0 行可给三个 key 都分配概率。加因果 mask 后该行 scores 形如 $[s_{00},-\infty,-\infty]$，softmax 恰为 $[1,0,0]$；第 2 行才可看 0、1、2。训练时目标句已知，可在一个矩阵运算中算出全部行的 teacher-forcing loss；mask 防止第 $i$ 行偷看正确的 $i+1$。推理时第 $i+1$ 的输入 token 尚不存在，仍须先采样第 $i$ 个 token，再继续。KV cache 保存先前层的 K/V，避免每步重算旧前缀，却无法消掉这个数据依赖。这正是[投机解码](../inference/speculative-decoding.mdx)能减少目标模型轮次的切入点。
+
+## 可运行代码
+
+[attention-is-all-you-need.py](../../examples/papers/attention-is-all-you-need.py) 是一个标准库的 shape walkthrough：位置编码、masked multi-head self-attention、FFN 残差式更新、encoder memory 及 decoder cross-attention 都会执行。权重和 embedding 是固定教学数，输出不表示模型质量或论文复现结果。
+
+脚本里的 multi-head 为可读性采用退化的固定投影：每个 head 的 $W_Q,W_K,W_V$ 是选择一个坐标的 one-hot 矩阵，$W_O=I$；它展示“投影、分头、拼接”的数据流，并不声称实现可学习的原论文 MHA。LayerNorm 也为缩短标准库示例而省略。脚本额外断言：把未来 token 的 value/key 改到极大，位置 0 的 causal 输出仍完全不变。
 
 ```python
-from math import exp, sqrt
+def attention(q, k, v, causal=False):
+    scores = matmul(q, transpose(k))
+    for i, row in enumerate(scores):
+        for j in range(len(row)):
+            row[j] = row[j] / sqrt(len(q[0])) if not causal or j <= i else -1e9
+    weights = [softmax(row) for row in scores]
+    return matmul(weights, v), weights
 
-q = [1.0, 0.0]
-keys = [[1.0, 0.0], [0.0, 1.0]]
-values = [[10.0, 0.0], [0.0, 20.0]]
-
-scores = [sum(a * b for a, b in zip(q, k)) / sqrt(len(q))
-          for k in keys]
-# 减去最大值，提高 softmax 的数值稳定性。
-weights = [exp(s - max(scores)) for s in scores]
-weights = [w / sum(weights) for w in weights]
-output = [sum(w * v[j] for w, v in zip(weights, values))
-          for j in range(len(values[0]))]
-print([round(w, 3) for w in weights])  # [0.67, 0.33]
-print([round(x, 3) for x in output])   # [6.698, 6.605]
+encoded, _ = multi_head(source)                  # encoder self-attention
+memory = add(encoded, ffn(encoded))
+decoded, maps = multi_head(target, causal=True)  # mask future target tokens
+cross, _ = attention(decoded, memory, memory)    # Q from decoder, K/V from encoder
 ```
 
-尝试将 `q` 改为 `[0.0, 1.0]`：查询改变后，权重会交换。再把两个 key 设为相同值，先预测权重，再运行检查。
+完整脚本的第 0 行 mask 权重为 `[1.0, 0.0]`，并打印 encoder memory 的 `3 x 2` shape。将 `causal=True` 改为 `False` 后再运行，便可观察第一个 decoder token 看见未来位置的错误数据流。
 
-## 原文阅读顺序
+## 工程权衡
 
-1. **图 1、§3.1**：分别画出编码器与解码器的数据流。
-2. **§3.2、图 2**：逐项对照 Q、K、V 和多头公式。
-3. **§3.5、§4**：思考位置信息与序列长度的计算成本。
-4. **§5、§6**：查看训练设置和实验，区分架构结论与特定任务结果。
+注意力矩阵为 $n\times n$，训练中其时间和显存随序列长度近似二次增长；flash attention 等内核改变的是计算与存储策略，不改变 $QK^T$ 的语义。生成时 batch、KV cache、上下文长度和采样策略共同决定吞吐及延迟。encoder–decoder 在翻译、摘要等有固定源输入的任务中可复用 encoder memory；decoder-only 则统一成一个因果流。评价模型时也应将架构、训练语料、tokenizer、参数量和解码参数分开，不能从“用了 Transformer”推出性能。
 
-## 常见误区
+### 一层为何仍不足以“读懂”句子
 
-解码器的因果 mask 遮住未来位置。训练时可对已知的目标序列并行计算多个位置，但生成未知输出仍逐步进行；“训练可并行”不等于“一次生成全部答案”。这也是继续读[投机解码](../inference/speculative-decoding.mdx)的切入点。
+单层 attention 的每个位置确实可以直接聚合所有允许的位置，但层叠才让前一层构造的局部或句法特征成为后一层的 K/V。残差连接给每层一条保留原表示的路径，LayerNorm 让层间数值尺度稳定；FFN 则在每个位置独立地变换已聚合的信息。可以将它们理解为“通信—逐点计算—再通信”的交替，而不要把 attention 当成唯一的计算来源。论文的编码器、解码器均堆叠六层，所列的 $d_{model}=512,h=8,d_k=64$ 是 base 配置而不是架构定义。
+
+在 cross-attention 中，源句 memory 的长度是 $n_s$、目标长度是 $n_t$，所以矩阵为 $n_t\times n_s$，并不必是方阵。decoder 的每一个 query 都可读取所有非 padding 源位置，因为源句已经完整可用；mask 仅约束目标侧 self-attention 的未来。翻译训练通常将目标序列右移一位作为 decoder 输入：输入 `<BOS> 我 喜欢`，预测 `我 喜欢 ...`。这种移位正是让“当前位置输入”和“当前位置标签”不相同的原因。
+
+### 从训练目标到逐 token 生成
+
+给定源 $x$ 和目标 $y$，模型按链式法则最大化 $\sum_t\log p(y_t\mid y_{<t},x)$。teacher forcing 将真实 $y_{<t}$ 同时提供给所有位置，因此可并行计算交叉熵；推理没有真实未来，只能由已采样或贪心选出的 token 逐步形成前缀。beam search 会同时保留多个前缀，temperature、top-k、top-p 则改变从 logits 取 token 的方式，均发生在 decoder 输出词表分布之后。原论文采用 beam search 与长度惩罚的翻译设置；把这些解码选择和网络架构分开，才不会将某个输出风格误归因于 attention。
+
+KV cache 的 shape 常可写为每层 `[batch, heads, past_length, head_dim]`。新增一个 token 时只计算它的 Q、K、V，将 K/V 追加，Q 对历史 K 做注意力；这把每步重算整个前缀的浪费去掉，却仍要对每层执行一次新 token 的前向。长上下文下 cache 容量、带宽与 batch 调度会成为瓶颈，也解释了为何推理优化常同时研究量化、分页 cache、连续批处理和投机解码。
+
+### 常见误读与检查方法
+
+attention 权重不是可靠的因果解释：某个高权重位置说明该头在当前计算中混入了其 value，并不证明该词“决定了”预测。多头也不保证人类可命名的分工；有些头可能冗余，信息可跨层重编码。用可视化检查时，先确认行列方向、是否包含 mask、是否是哪个 layer/head，再讨论模式。对实现做最小测试时，可将未来 value 改成极大数并检查 masked 的早期位置输出不变；这比只看一张热图更能发现因果 mask 方向写反。
+
+位置编码也不等于模型具备无限长度泛化。正余弦函数可在定义域外计算，但训练长度、注意力模式和数值尺度仍会限制效果。不同 Transformer 变体可能交换 norm 顺序、激活函数、位置方案或 attention kernel；这些变化值得单独说明。阅读原文实验时，应将 WMT 翻译 BLEU、训练成本和参数表放回 2017 年的设置中，不把它们当作对今天所有模型的排行榜结论。
+
+复现学习时，先以极小矩阵确认 mask、行 softmax 与 cross-attention 的方向，再替换为张量库和训练循环。这样出现形状错误时，能区分是数学语义错误还是工程实现错误。
 
 ## 自测
 
-1. 为什么 `QKᵀ` 的结果还不是最终输出？
-2. 将全部 key 设为相同值，注意力会怎样分配？
-3. 为什么阅读生成模型时，要区分训练并行与生成串行？
+1. 为什么 $QK^T$ 不是最终输出？
+
+<details>
+<summary>答案</summary>
+
+它只是 query–key 分数；还需缩放、mask、softmax，再与 $V$ 相乘。
+
+</details>
+
+2. 第 0 个 decoder 位置加因果 mask 后能看谁？
+
+<details>
+<summary>答案</summary>
+
+只能看自己，注意力行是 `[1,0,\ldots]`。
+
+</details>
+
+3. 为什么训练并行而生成串行？
+
+<details>
+<summary>答案</summary>
+
+训练有完整已知目标；生成的下一输入依赖刚抽到的 token，cache 只复用历史计算。
+
+</details>
 
 ## 原始资料
 

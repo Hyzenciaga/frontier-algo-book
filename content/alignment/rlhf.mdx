@@ -2,44 +2,59 @@
 
 ## 直觉
 
-RLHF（Reinforcement Learning from Human Feedback）是一套训练框架：先让人比较候选回答，再将这种偏好转成可优化信号，最后用强化学习更新策略。经典实现常是 `SFT → 奖励模型（RM）→ PPO`，但这是一条常见管线，不是 RLHF 的定义本身；也可以用 DPO 等直接偏好目标替代显式 RM 加 PPO 的后两步。
+人通常更容易回答“两条回复哪条更好”，而难以写出完整奖励函数。RLHF 先把这种相对判断压缩为奖励模型，再让策略在 KL 约束下追求该模型的高分。
 
-## 前置知识
+## 前置知识与机制推导
 
-给提示 `x` 采样两个回答 `yw, yl`，标注者选择较好者。Bradley–Terry 假设奖励模型 `rφ` 满足：
+对同一 $x$ 的胜者 $y_w$、败者 $y_l$，Bradley--Terry 假设 $P(y_w\succ y_l)=\sigma(r_\phi(x,y_w)-r_\phi(x,y_l))$，故 $L_{RM}=-\log\sigma(r_w-r_l)$。奖励只由差值识别：全体加同一常数不变。随后最大化 $\mathbb E[r_\phi]-\beta KL(\pi\Vert\pi_{ref})$；RL 阶段的梯度并不穿过离散 token，而用 log-prob score function 乘优势估计。
 
-```
-P(yw ≻ yl | x) = sigmoid(rφ(x,yw) - rφ(x,yl))
-L_RM = -log P(yw ≻ yl | x)
-```
+## 数据流程
 
-随后策略可最大化简化目标：
+从 SFT/当前策略对每个提示采多条候选，随机化左右位置给标注者比较；保留分歧、长度与来源。训练/验证要按 prompt 切分，评估 RM 的 held-out pair accuracy，也要用人盲评最终策略。候选始终来自旧模型会造成分布偏移：新策略可能找到 RM 从未见过的漏洞，因此需在线再采样、审计和 KL。
 
-```
-E[rφ(x,y)] - β * KL(πθ(.|x) || πref(.|x))
-```
+## 一对比较如何变成更新，及其失效方式
 
-其中 `πref` 通常冻结为 SFT 策略。KL 防止模型只钻 RM 的空子；但它只是约束，不能证明奖励模型没有漏洞。
+若胜者/败者奖励为 $(1.2,0.3)$，差 $d=0.9$，预测偏好概率为 $\sigma(d)=0.711$，NLL 为 $0.341$。对胜者奖励的导数是 $\sigma(d)-1=-0.289$，梯度下降提高 $r_w$；对败者则为 $+0.289$。这只拟合“谁更好”，不校准绝对分数。RM 接着把一个未标注回复打成 10 分时，策略会通过策略梯度提高产生该回复的 token 概率；RM 本身通常冻结，不能在该离散生成路径上自动纠错。
 
-## 流程
-
-先定义标注规范和冲突处理，再从当前模型或多个模型生成候选，收集排序并训练、保留测试 RM。用 PPO 等算法按 RM 回报更新策略，持续监测 KL、奖励、人工盲评与拒答率。实际系统还会混入预训练或 SFT 损失以减轻能力遗忘。
+reward hacking 出现在代理指标和真实偏好分叉时。例如标注数据里长摘要常更受偏好，RM 学到长度特征；PPO 继续优化后，策略可能输出冗长、重复却覆盖关键词的摘要。检测要同时画 RM 分数、人评、长度和 KL 随训练步的曲线，并用长度配平的比较集和对抗提示复核。修正不是只把 KL 调大：需要补入该漏洞处的新比较、改 rubric 或把长度作为受控变量。RM 的 pair accuracy 即使很高，也可能只是在容易比较的旧分布上高。
 
 ## 小例子
 
-“解释合同条款”有 A（清楚且提醒咨询专业人士）和 B（自信地下结论）。标注者偏好 A，RM 学到相对分数；RL 阶段增加 A 类输出概率。若训练集中只奖励“看起来详细”，策略可能制造无用免责声明或冗长文本，这正是要用独立人工评审发现的 reward hacking。
+```python
+"""Bradley--Terry 比较损失和奖励可加常数的不辨识性。"""
+import math
+r_win, r_lose = 1.2, .3
+p = 1/(1+math.exp(-(r_win-r_lose)))
+print("P(win preferred)=", round(p, 3), "NLL=", round(-math.log(p), 3))
+print("shift invariant:", round(1/(1+math.exp(-((r_win+5)-(r_lose+5)))), 3))
+```
+
+运行 `python examples/alignment/rlhf.py` 两个概率均为 `0.711`。 [下载示例](../../examples/alignment/rlhf.py)
 
 ## 常见误区
 
-RLHF 不等于“模型听从每个标注员”。它拟合的是数据、规则和聚合流程产生的偏好。奖励模型也不是客观真理，面对分布外提示会错。更关键的是，DPO 可以使用同样的 `(x,yw,yl)` 人类偏好数据，却省去单独训练显式 RM；因此不能因未见 PPO 就断言不是偏好对齐。
+RM 准确率高不代表优化后仍可靠；它只在比较数据分布上被验证。长度若与“好”共现，模型可能刷长文；这需要长度配平和最终人评。比较也不是客观真值，规范和标注者分歧必须显式保留。
+
+## 不辨识性与受 KL 约束的策略
+
+Bradley--Terry 的 likelihood 只看 $r_w-r_l$，故 $r'(x,y)=r(x,y)+c(x)$ 完全同样；不能把 RM 的 7 分解释成跨提示的绝对效用。固定奖励时，加入归一化约束求 $\max_\pi\sum_y\pi(y)r(y)-\beta\sum_y\pi(y)\log(\pi(y)/\pi_{ref}(y))$，一阶条件给出 $\pi^*(y)\propto\pi_{ref}(y)e^{r(y)/\beta}$。这解释 KL 的指数倾斜，也说明 reward scale 与 $\beta$ 只能相对解释。
 
 ## 自测问题
 
-1. 经典 RLHF 的三个阶段分别产出什么？
-2. 为什么奖励上涨仍必须做人类盲评？
-3. KL 正则中的参考策略承担什么角色？
+1. 为何 RM 只能识别相对奖励？
+2. 为什么要在线补数据？
+3. KL 解决什么、不解决什么？
+
+<details>
+<summary>答案</summary>
+
+1. 损失只含奖励差。
+2. 新策略改变了 RM 的输入分布。
+3. 它限制漂移，不能补齐遗漏偏好。
+
+</details>
 
 ## 原始参考资料
 
-- [Ouyang 等，InstructGPT](https://arxiv.org/abs/2203.02155)
-- [Rafailov 等，DPO](https://arxiv.org/abs/2305.18290)
+- [InstructGPT](https://arxiv.org/abs/2203.02155)
+- [Learning from human preferences](https://openai.com/index/learning-from-human-preferences/)

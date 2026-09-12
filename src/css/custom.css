@@ -215,3 +215,33 @@ input[type=range] {display: block; width: 100%; accent-color: #155bdf; margin: 1
   .paper-content h3 {font-size: 25px; line-height: 1.4;}
   .paper-reading-note {padding: 22px;}
 }
+
+/* Typeset equations stay scrollable inside narrow reading columns. */
+.katex-display {overflow-x: auto; overflow-y: hidden; padding: 10px 2px;}
+.theme-doc-markdown .katex {font-size: 1.08em;}
+.theme-doc-markdown details {margin: 24px 0; padding: 16px 20px; background: var(--book-panel); border: 1px solid var(--book-border); border-radius: 7px;}
+.theme-doc-markdown summary {cursor: pointer; font-weight: 600;}
+.benchmark-lenses {display: flex; flex-wrap: wrap; gap: 12px 30px; padding-top: 16px; color: var(--ifm-color-primary); font-size: 14px;}
+.benchmark-entry {padding: 30px; border: 1px solid var(--book-border); border-radius: 8px;}
+.benchmark-entry h2 {font-size: 38px; margin: 8px 0 12px;}
+.benchmark-entry h3 {font-size: 22px;}
+.benchmark-entry > p {color: var(--book-muted);}
+.benchmark-facts {display: grid; grid-template-columns: repeat(3, 1fr); gap: 22px; border-top: 1px solid var(--book-border); border-bottom: 1px solid var(--book-border); padding: 22px 0; margin: 26px 0;}
+.benchmark-facts dt {font-size: 13px; color: var(--book-muted); margin-bottom: 8px;}
+.benchmark-facts dd {margin: 0; font-size: 15px; line-height: 1.8;}
+.metric-comparison {display: grid; gap: 24px; margin-top: 22px;}
+.reliability-track > div {background: #168174;}
+.trial-strip {display: flex; gap: 8px; margin: 12px 0;}
+.trial-strip > span {flex: 1; text-align: center; border: 1px solid var(--book-border); border-radius: 4px; font-size: 15px;}
+.trial-success {background: var(--book-blue-wash); color: var(--ifm-color-primary);}
+.trial-failure {background: var(--ifm-background-color); color: var(--book-muted);}
+.task-table {overflow-x: auto; margin-bottom: 24px;}
+.task-table table {display: table; min-width: 680px; width: 100%; margin: 0;}
+.task-table:focus-visible {outline: 2px solid var(--ifm-color-primary); outline-offset: 2px;}
+.table-scroll-hint {display: none;}
+@media (max-width: 700px) {
+  .benchmark-entry {padding: 22px;}
+  .benchmark-facts {grid-template-columns: 1fr; gap: 14px;}
+  .trial-strip {gap: 4px;}
+  .table-scroll-hint {display: block; color: var(--book-muted); font-size: 13px;}
+}

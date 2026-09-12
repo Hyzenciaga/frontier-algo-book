@@ -2,42 +2,66 @@
 
 ## 直觉
 
-PPO（Proximal Policy Optimization）是策略梯度算法，核心问题是：当前批数据看起来有利时，怎样多做几步梯度更新而不让新策略突然失控？它通过概率比的裁剪，减少把某一动作概率推得过远的激励。在 RLHF 中，PPO 常把奖励模型分数加上 KL 惩罚作为回报；PPO 本身并不规定奖励来自人类。
+PPO 允许用同一批 rollout 做多个小批更新，并用裁剪抑制一次更新把采样策略推得过远的激励。它是近端近似，不是硬 KL 约束的数学等价物。
 
-## 前置知识与简化公式
+## 前置知识与机制推导
 
-用旧策略 `πold` 采样 `(s_t,a_t)`，优势估计为 `A_t`，新旧动作概率比为 `r_t=πθ(a_t|s_t)/πold(a_t|s_t)`。PPO-Clip 的简化目标是：
+旧策略 $\pi_{old}$ 采样 token 后，重要性比 $\rho_t=\pi_\theta(a_t|s_t)/\pi_{old}(a_t|s_t)$。clipped surrogate 为
 
-```
-Lclip = E[min(r_t*A_t, clip(r_t, 1-ε, 1+ε)*A_t)]
-```
+$$
+L^{clip}=\mathbb E[\min(\rho_tA_t,\operatorname{clip}(\rho_t,1-\epsilon,1+\epsilon)A_t)].
+$$
 
-`ε` 常取小值。正优势下，超过上界的继续增益会被截断；负优势下，过度降低概率也不再获得目标收益。这不是硬性保证参数或行为绝不变化，而是一个近端更新的近似手段。
+正优势且比率超过 $1+\epsilon$ 时不再奖励继续抬升；负优势低于 $1-\epsilon$ 时也截断。实际语言 PPO 常加 value loss、熵项和对 reference 的 KL 惩罚。优势可由 $A_t=G_t-V(s_t)$ 或 GAE 估计；价值误差会把噪声带给策略。
 
-## 流程
+## 数据流程
 
-1. 冻结旧策略，从它采样一批完整回答或轨迹。
-2. 由 RM、验证器或环境给回报，拟合价值函数并计算优势。
-3. 在同一批数据上做若干 mini-batch 更新，监控近似 KL，必要时早停。
-4. 将新策略变为下一轮旧策略，再重新采样。
+冻结行为策略，按 prompt rollout，保存每 token old log-prob、value、mask 与末端 RM/验证奖励；计算回报、归一化优势，再做有限 epoch minibatch。监控 clip fraction、近似 KL、熵、长度和 reward。rollout 过旧、epoch 太多或 token mask 错位都会使 ratio 无意义。
 
-这解释了为何 PPO 是 on-policy：过度复用很旧数据时，`r_t` 与优势不再对应当前交互分布。其“可多 epoch 用一批”不等于任意离线回放。
+## GAE 与正负优势的分段手算
+
+价值残差 $\delta_t=r_t+\gamma V(s_{t+1})-V(s_t)$，GAE 为 $A_t^{GAE}=\sum_{l\ge0}(\gamma\lambda)^l\delta_{t+l}$。$\lambda=0$ 只用一步 TD，方差低但依赖价值估计；$\lambda=1$ 接近 Monte Carlo，偏差小、方差高。例：两步终局，$V(s_0)=0.4,V(s_1)=0.6,r_0=0,r_1=1,\gamma=1,\lambda=0.95$，有 $\delta_0=0.2,\delta_1=0.4$，$A_0=0.2+0.95\times0.4=0.58$。
+
+设 $\epsilon=0.2$。正优势 $A=2$ 时，$\rho=1.35$ 的未裁剪值为 $2.7$、裁剪值 $2.4$，取 $2.4$；该样本的 clipped surrogate 对继续提高 ratio 已无额外激励。负优势 $A=-2$ 时，同一 $\rho=1.35$ 的两个值是 $-2.7,-2.4$，取较小的 $-2.7$：提高坏动作概率仍会被惩罚；而 $\rho=0.7$ 时取 $\min(-1.4,-1.6)=-1.6$，避免把坏动作概率压得过低。这里的 old 是产生 rollout 的行为策略，用于重要性比；ref 是通常固定的 SFT 策略，用于语言能力锚定 KL，二者不能混用。
+
+一个简化更新链路是：采样回复、RM 给末端奖励，价值网络给 $V$，用 GAE 产生每 token $A$，以 old log-prob 算 ratio，再加 reference KL。若没有保存 old log-prob，却拿 ref 替代，目标已不再是 PPO，对多 epoch 复用也失去近端含义。
 
 ## 小例子
 
-数学回答经验证得 1 分，错误得 0 分。若某段推理使正确答案出现，`A_t>0`，PPO 提高该轨迹 token 概率；若一次更新把比率推到 `1+ε` 之外，裁剪目标不再鼓励继续推。实际 RLHF 还会把与 `πref` 的 KL 作为额外回报或惩罚项。
+```python
+"""PPO clipped surrogate 在正、负优势下的逐样本目标。"""
+def clip(x, lo, hi): return max(lo, min(x, hi))
+for ratio, advantage in [(1.35, 2.0), (1.35, -2.0), (.7, 2.0)]:
+    unclipped = ratio*advantage; clipped = clip(ratio,.8,1.2)*advantage
+    print(ratio, advantage, "objective=", min(unclipped, clipped))
+```
+
+运行 `python examples/alignment/ppo.py`：正优势的 `1.35` 被截到 `2.4`，负优势不会被同方向误截。 [下载示例](../../examples/alignment/ppo.py)
 
 ## 常见误区
 
-PPO 不是“加 KL 就是 PPO”：PPO-Clip 可不在目标中直接写 KL，工程上却常监控或另加参考 KL。它也不要求奖励模型，机器人环境和可验证奖励同样可用。裁剪不能自动消除奖励黑客、价值估计误差或数据偏差。
+clip 不是保证 KL 小的锁；多轮更新仍可能漂移。优势归一化只改变尺度，不会修复错误奖励。奖励上升而人评下降是 RM 过优化的信号。
+
+## 符号表与反向递推
+
+$r_t$ 是环境或末端奖励，$\rho_t$ 是新旧策略概率比，$V_t$ 是价值估计，$\delta_t$ 是 TD 残差，$A_t$ 是优势。实现 GAE 常从末端反向：`gae = delta_t + gamma * lambda * nonterminal * gae`，再令 `return_t = gae + V_t`。终止 mask 很关键：漏乘会把下一条样本的价值泄入本题；把截断当终止则会系统性低估仍可继续的状态。
 
 ## 自测问题
 
-1. `r_t` 的分子与分母分别是什么？
-2. 为什么 PPO 每轮都要重新采样？
-3. Clip 对正优势动作的过度增概率如何作用？
+1. 为何 ratio 用旧策略？
+2. 正负优势的截断为何不同？
+3. value 网络错会怎样？
+
+<details>
+<summary>答案</summary>
+
+1. 它校正 rollout 的采样分布。
+2. 目标对两种符号都取更保守项。
+3. 优势方差或偏差增大，更新方向会变坏。
+
+</details>
 
 ## 原始参考资料
 
-- [Schulman 等，PPO 原论文](https://arxiv.org/abs/1707.06347)
+- [Proximal Policy Optimization](https://arxiv.org/abs/1707.06347)
 - [OpenAI Spinning Up：PPO](https://spinningup.openai.com/en/latest/algorithms/ppo.html)

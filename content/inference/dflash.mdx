@@ -1,32 +1,86 @@
 # DFlash：用块扩散草稿并行猜 token
 
-## 直觉
+## 前置：把草稿阶段也并行化
 
-普通草稿模型也要一个 token 接一个 token 地写，草稿阶段仍是串行的。DFlash（Block Diffusion for Flash Speculative Decoding）把草稿限定为一个轻量的块扩散模型：它在一次前向中提出一个 token 块，再交给自回归目标模型验证。把扩散模型放在「提案者」位置，目标模型仍保持最终裁决，因而不必把扩散模型当成独立回答模型来承受其质量差距。
+传统投机解码虽把目标验证并行化，草稿模型仍要从左到右生成 $\gamma$ 个 token。DFlash（Block Diffusion for Flash Speculative Decoding）将草稿器换成轻量的**块扩散**模型：从目标模型抽取当前上下文特征作为条件，让一个块内的多个位置共同被预测。它试图消除草稿端的串行深度；目标自回归模型仍逐轮验证并决定最终输出。
 
-## 前置
+设目标特征为 $c\in\mathbb{R}^d$，块长为 $B$。DFlash 块以一个**干净 anchor** 开头，后接 $B-1$ 个 mask；anchor 是上一轮目标验证给出的 bonus token。草稿器一次输出 $Z\in\mathbb{R}^{(B-1)\times|V|}$。这不是一般扩散 LLM 的多轮去噪：DFlash v1 在**一次**草稿前向中同步解码所有 mask。验证后仍只能提交从块首开始的连续前缀。
 
-它是投机解码的草稿器替换，而非新的采样正确性规则。部署端仍应以标准 `p/q` 接受和残差重采样保证随机采样与目标分布一致；若系统只做 greedy，则是在验证目标的贪心选择。DFlash 需要针对特定目标模型训练，并读取目标模型抽取的上下文特征，因此不是任意两个现成模型随手配对就能得到论文效果。
+## 机制：目标特征条件化的并行草稿
 
-## 机制
+预填充时，DFlash 从浅到深抽取若干目标层 hidden state，拼接并投影为 $H_{ctx}\in\mathbb{R}^{n\times d}$。对每个草稿层 $i$，它将该条件直接注入 key/value：$K_i=[H_{ctx}W_i^K;H_dW_i^K]$，$V_i=[H_{ctx}W_i^V;H_dW_i^V]$。于是每层 draft query 都能读取持久的目标上下文，而不是只在输入 embedding 融合一次后让信息逐层稀释。
 
-论文的核心是「目标最懂自己的未来」：自回归目标的隐藏特征带有多 token 的未来信息。DFlash 从目标模型抽取上下文特征，作为轻量块扩散草稿器的条件；草稿器并行生成块内多个候选 token。随后目标模型对整块做验证，接受连续前缀并在拒绝处按标准投机采样修正。草稿块的并行性降低草稿时间，但块内 token 不按左到右依赖也带来问题：越靠后的 token 往往越容易被拒绝。
+训练随机取响应中干净 token 作 anchor，屏蔽其后的 $B-1$ 位，匹配推理中“bonus token 是干净条件”的路径。多个块可以拼进一个训练序列：同块内双向可见以并行预测，跨块严格隔离以防真 token 泄漏。首位错误会废弃整个后缀，论文对第 $k$ 位交叉熵使用 $w_k=\exp(-(k-1)/\gamma)$，让早位置承担更大损失权重。
 
-## 例子
+若用于随机采样，候选的实际条件分布 $q_i$ 仍必须可得，逐点做 $\min(1,p_i(y_i)/q_i(y_i))$ 接受，首次拒绝时按 $[p_i-q_i]_+$ 抽样。若实现只取每行 argmax，则它是验证目标贪心解码的工程变体，不能宣称采样无偏。DFlash 的贡献是更快地产生候选块，不是改变这个校正定理。
 
-设目标需要回答代码补全，DFlash 一次提议 7 个 token。目标验证后前 5 个连续通过，第 6 个被拒绝：运行时提交前 5 个，在第 6 位从残差分布采样一个 token，然后开始下一轮。即使一次提议了 7 个，也没有「整块全中才有收益」：接受前缀已经节省了多次目标模型串行调用。
+## 具体算例
 
-## 误区
+令 $B=5, |V|=3$，除去一个干净 anchor 后，草稿同时提出 `[A, B, B, A]`。目标验证后第 1、2 位通过，第 3 位首次拒绝，运行时提交 A、B，并在第 3 位修正，然后丢弃原第 4 位。已接受的两位依然节省了两次未来目标轮次。若同样的块常在第二位就拒绝，增大 $B$ 只会让更多尾部 logits、KV slot 和验证算力被浪费；不能以“一次写四个”推断四倍加速。
 
-「单次前向出一块」不等于所有 token 同样可靠；长块会使尾部接受率下降。论文报告的超过 6 倍 lossless acceleration 是特定模型、任务与服务设置的实验结果，不能视为所有硬件、上下文长度或并发下的承诺。也不要把 DFlash 的扩散草稿与最终输出的采样机制混为一谈：无损性来自验证器的接受/残差校正。
+## 可运行代码
+
+[dflash.py](../../examples/inference/dflash.py) 检查两个论文不变量：同块双向、跨块隔离但均可读 context KV；以及从块首递减的位置损失权重。它不模拟多步扩散或性能。
+
+```python
+from math import exp
+
+def visible(query, key, block_of, context_count=1):
+    return key < context_count or block_of[query] == block_of[key]
+block_of = (None, 0, 0, 0, 1, 1, 1)  # 0 是 context KV
+assert visible(1, 3, block_of)       # 同块可见未来 mask 位
+assert not visible(1, 4, block_of)   # 跨块不可见
+weights = [exp(-k / 3) for k in range(3)]
+```
+
+### 从前缀概率推导成本
+
+设本轮最多验证 $m=B-1$ 个草稿，$N$ 是最终通过的草稿数。整数变量的尾和公式给出 $\mathbb E[N]=\sum_{j=1}^{m}P(N\ge j)$；加上拒绝后的修正 token 或全接受后的 bonus token，每轮期望进度为 $\tau=1+\mathbb E[N]$（暂不考虑 EOS）。若各位置的条件接受概率均为 $a$，则 $\tau=1+a+\cdots+a^m$。这是用于手算的同质假设，不是所有真实位置都同等容易。
+
+例如 $a=0.8,m=4$，有 $\tau=3.3616$。若目标逐 token 需 10 毫秒，草稿块需 2 毫秒、验证需 12 毫秒，则教学模型中的平均延迟为 $14/3.3616\approx4.16$ 毫秒/token，约为基线的 2.40 倍速度；绝不是块长 5 就五倍加速。提高块长会同时改变接受曲线和验证成本，应重算整个分式。这组时间是人造算例。
+
+### 训练 mask 的两种边界
+
+“同块双向”只允许各预测位置读本块的 anchor 和 mask 表示，并不允许读该位置的真实标签。target 虽能一次处理干净训练序列，注入给某个草稿块的 context KV 仍必须截止到它允许的前缀；若把未来位置的 target hidden state 无限制暴露给它，跨块隔离也救不了信息泄漏。上面的代码只有一份两个块都允许读取的公共前缀，完整训练则要为每块构造各自的 context 可见范围。
+
+位置权重也不是改写目标采样分布。令第 $k$ 位交叉熵为 $\ell_k=-\log q_k(y_k)$，教学损失可写作 $L=\sum_k w_k\ell_k/\sum_k w_k$。它在训练阶段强调较早位置；推理阶段仍以目标验证决定提交。将更大训练权重与更宽松的接受阈值混为一谈，会破坏投机校正的语义。
+
+## 工程权衡
+
+并行草稿降低延迟，却把目标层选择、hidden width、tokenizer、共享 embedding/LM head 与 checkpoint 绑定在一起。DFlash v1 的关键前提是单次前向预测整个 masked block；不要把一般 dLLM 的多步去噪调参套到它。论文的 “over 6x” 只在特定模型、任务、block size 与硬件下成立，复验应分别报告接受长度、验证 token 数、草稿/验证耗时和端到端延迟。
+
+最有价值的检查是条件路径：anchor 是否真来自 target bonus token；每层是否都有 target KV；同块双向是否成立且跨块无泄漏；权重是否从块首递减。用于随机采样时，还须由实际实现提供与验证顺序一致的草稿 $q_i$；若只运行 greedy 验证，应明确它只说明贪心路径，不说明采样无偏。
 
 ## 自测
 
-1. DFlash 的扩散并行性主要省掉目标模型还是草稿模型的串行工作？
-2. 块末尾拒绝率上升时，增加块长一定更快吗？
-3. 为什么 DFlash 仍必须让目标模型验证？
+1. DFlash v1 每轮对 mask 做几次草稿前向？
+
+<details>
+<summary>答案</summary>
+
+一次；干净 anchor 加 $B-1$ mask 在单次前向中并行解码。
+
+</details>
+
+2. 为什么向每层 K/V 注入目标特征？
+
+<details>
+<summary>答案</summary>
+
+让每层都可读取持久目标上下文，避免条件只在输入端融合后被层叠稀释。
+
+</details>
+
+3. 同块双向、跨块隔离分别解决什么？
+
+<details>
+<summary>答案</summary>
+
+前者允许并行补全一个块，后者阻止其他训练块的真 token 泄漏。
+
+</details>
 
 ## 原始资料链接
 
 - [DFlash 论文（arXiv）](https://arxiv.org/abs/2602.06036)
-- [DeepSeek DeepSpec：包含 DFlash、DSpark、Eagle3 的训练与评测代码](https://github.com/deepseek-ai/DeepSpec)
+- [DFlash 官方代码（z-lab/dflash）](https://github.com/z-lab/dflash)

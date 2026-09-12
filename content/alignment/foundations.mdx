@@ -2,45 +2,68 @@
 
 ## 直觉
 
-语言模型首先是一个「下一个 token 概率分布」：给定前文 `x`，策略 `πθ(y|x)` 为每个可能的下一个 token `y` 分配概率。对齐训练不改变这个基本形式；它只是让分布更偏向人、规则或可验证器认可的完整回答。把一个完整回答看作连续动作，提示词是状态，模型便是一项序列决策策略。
+给定提示 $x$，自回归策略逐 token 定义 $\pi_\theta(y_t\mid x,y_{\lt t})$，整段回答概率是各条件概率的乘积。对齐不改变这个机制；它改变哪些完整轨迹更常出现。提示可视作状态、token 为动作、整段回答为一条轨迹，评价可在末尾才给出。
 
-## 前置知识
+## 前置知识与机制推导
 
-SFT 的训练样本是 `(x, y*)`，其中 `y*` 是目标 token。交叉熵（也就是负对数似然）可写成：
+示范的最大似然目标是 $L_{SFT}=-\sum_t\log\pi_\theta(y_t^*\mid x,y^*_{\lt t})$。若得到序列奖励 $r$，一个基本目标为
 
-```
-L_SFT = - Σ_t log πθ(y*_t | x, y*_<t)
-```
+$$
+\max_\pi\;\mathbb E[r(x,y)]-\beta D_{KL}(\pi(\cdot\mid x)\Vert\pi_{ref}(\cdot\mid x)).
+$$
 
-它只奖励“把示范答案复现出来”。KL 散度衡量两个分布的差异，常用方向是 `KL(πθ || πref)`；它不是对称距离。对齐里 `πref` 往往是 SFT 后冻结的参考策略，用来限制模型为刷奖励而偏离语言能力。
+在有限输出空间对每个概率求导并加归一化约束，解为 $\pi^*(y\mid x)\propto\pi_{ref}(y\mid x)\exp(r/\beta)$。KL 因而是偏离原策略的价格，不是安全证明。策略梯度利用 $\nabla J=\mathbb E[\sum_t\nabla\log\pi(y_t\mid s_t)A_t]$；减去仅依赖状态的基线不改期望、能降方差。
 
-强化学习的目标可简化为 `J(θ)=E[R]`。策略梯度的可采样形式是：
+## 数据流程
 
-```
-∇J ≈ Σ_t ∇log πθ(a_t|s_t) * A_t
-```
+先固定提示分布与评价规范，再收集示范、比较或验证结果；按提示而非随机 token 切分，防近重复泄漏。记录模板、mask、行为策略 log-prob、长度、奖励和 KL。PPO 数据必须接近当前行为策略；旧数据的概率比会失真。离线偏好数据也只代表产生它的模型附近。
 
-`A_t`（优势）表示该动作比当前预期好多少；正值提高其概率，负值降低。它是简化式：实际实现还会有折扣、价值网络、归一化和 KL 正则。
+## 从序列概率到一次更新
 
-## on-policy 与 off-policy
+设词表只有 `A,B`，提示后目标序列为 `A,B`。第一个位置 $p(A)=0.8$；在已知 `A` 后 $p(B\mid A)=0.5$，故整段概率是 $0.8\times0.5=0.4$，而非两个概率的平均。负对数似然为 $-\log0.4=0.916$，可拆成 $-\log0.8-\log0.5=0.223+0.693$。这种可加性使变长序列能按 token 求和，也解释了为何一个很低概率 token 会支配整句 loss。
 
-on-policy 指用于更新的数据由当前或刚刚冻结的策略采样；PPO 属于此类，数据过旧会使概率比和优势估计失真。off-policy 可以重用行为策略产生的旧数据，通常须做重要性校正或使用相应目标。DPO 常在固定偏好数据上直接训练，实务上通常称离线/离策略式偏好优化，但不应把“没有在线采样”误读为所有数学假设都消失。
+再看 softmax 的一个位置。$p_j=e^{z_j}/\sum_k e^{z_k}$，对正确类别 $c$ 的 loss 是 $-z_c+\log\sum_k e^{z_k}$，所以 $\partial L/\partial z_j=p_j-\mathbb1[j=c]$。若 $p=(0.8,0.2)$、目标是第二类，梯度是 $(0.8,-0.8)$；学习率 $0.1$ 的梯度下降给原 logits 的增量是 $(-0.08,+0.08)$，下一次 softmax 更偏向目标。这是对齐训练所有“提高好轨迹概率”表述在单位置上的实际含义。
 
 ## 小例子
 
-提示“`2+2=?`”后，模型给 `4` 的概率从 0.7 提至 0.9 是一次策略改变。若奖励只看答案正确，模型可能开始输出极长推导来碰巧通过；加入相对参考模型的 KL，等于同时问它：提高奖励是否值得牺牲原本自然、稳定的分布？
+参考策略对短答、长答为 $(0.7,0.3)$，奖励为 $(0.2,1.0)$，$\beta=0.5$。闭式解会偏好长答但不把短答归零。
+
+```python
+"""枚举序列策略、回报与 KL 正则（仅标准库）。"""
+import math
+ref = {"short": .70, "long": .30}; reward = {"short": .2, "long": 1.0}; beta = .5
+z = sum(ref[a] * math.exp(reward[a] / beta) for a in ref)
+policy = {a: ref[a] * math.exp(reward[a] / beta) / z for a in ref}
+kl = sum(policy[a] * math.log(policy[a] / ref[a]) for a in ref)
+print(policy, "KL=", round(kl, 4))
+```
+
+运行 `python examples/alignment/foundations.py` 输出约 `long: 0.680`、`KL=0.3056`。 [下载示例](../../examples/alignment/foundations.py)
 
 ## 常见误区
 
-交叉熵小不等于人类更喜欢：它只拟合给定标签。KL 小也不等于安全：它只限制相对变化。策略梯度不是对奖励模型参数求导，而是利用采样回报调整生成概率。最后，token 概率高不代表整段答案的奖励高，序列回报可来自最终结果。
+交叉熵低只表示复现标签更好；KL 小不推出正确或安全。token 概率也不等于整段回报。遗漏“诚实、简洁、可读”的奖励维度时，优化器会稳定地利用遗漏。
+
+## 基线为何不改期望
+
+对固定状态 $s$ 和任意不依赖动作的 $b(s)$，有 $\mathbb E_{a\sim\pi}[b(s)\nabla\log\pi(a|s)]=b(s)\sum_a\pi(a|s)\nabla\log\pi(a|s)=b(s)\nabla\sum_a\pi(a|s)=0$。所以回报可替换为 $R-b(s)$。这只是在期望上成立：若基线估计来自同一批有限样本，或错误地依赖当前动作，仍可能引入偏差。价值网络的作用是拟合条件期望回报，从而减小而非消灭方差。
 
 ## 自测问题
 
-1. 为什么 SFT 的目标不需要显式奖励函数？
-2. `KL(πθ || πref)` 为什么能抑制奖励投机却不能保证正确？
-3. 若样本来自很久以前的模型，为什么直接套 PPO 会有风险？
+1. 为什么奖励同加常数不改变最优策略？
+2. $\beta$ 减小会怎样？
+3. 为什么基线不改变梯度期望？
+
+<details>
+<summary>答案</summary>
+
+1. 常数进入归一化项。
+2. 策略更激进地偏离参考。
+3. 条件于状态的 score function 期望为零。
+
+</details>
 
 ## 原始参考资料
 
-- [OpenAI Spinning Up：策略优化导论](https://spinningup.openai.com/en/latest/spinningup/rl_intro3.html)
-- [OpenAI Spinning Up：RL 算法分类](https://spinningup.openai.com/en/latest/spinningup/rl_intro2.html)
+- [OpenAI Spinning Up：策略梯度](https://spinningup.openai.com/en/latest/spinningup/rl_intro3.html)
+- [InstructGPT](https://arxiv.org/abs/2203.02155)

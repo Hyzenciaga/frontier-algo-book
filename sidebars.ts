@@ -16,5 +16,9 @@ const sidebars: SidebarsConfig = {
       'inference/speculative-decoding', 'inference/eagle', 'inference/dflash', 'inference/dspark',
     ]},
   ],
+  papers: [
+    {type: 'link', label: '← 论文目录', href: '/papers'},
+    {type: 'category', label: '模型架构', collapsed: false, items: ['papers/attention-is-all-you-need']},
+  ],
 };
 export default sidebars;

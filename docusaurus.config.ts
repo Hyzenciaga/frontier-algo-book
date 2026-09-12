@@ -23,7 +23,7 @@ const config: Config = {
       title: '前沿算法手册', logo: {alt: '', src: 'img/favicon.svg'},
       items: [
         {to: '/learn/roadmap', label: '学习路线', position: 'left'},
-        {to: '/lab', label: '交互实验', position: 'left'},
+        {to: '/papers', label: '论文目录', position: 'left'},
         {href: 'https://github.com/Hyzenciaga/frontier-algo-book', label: 'GitHub', position: 'right'},
       ],
     },

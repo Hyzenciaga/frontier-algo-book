@@ -1,6 +1,6 @@
 # 前沿算法手册 · Frontier Algo Book
 
-面向自学者的中文学习手册：从 SFT、偏好对齐和强化学习，到 Agent 学习与投机解码。首版包含 **15 篇主题章节 + 学习路线 + 3 个交互实验**。正文附原始资料，并注明术语不确定性及教学简化。
+面向自学者的中文学习手册：从 SFT、偏好对齐和强化学习，到 Agent 学习与投机解码。首版包含 **15 篇主题章节 + Transformer 导读 + 学习路线 + 3 个章节内实验**。正文附原始资料，并注明术语不确定性及教学简化。
 
 ## 技术选择
 
@@ -43,7 +43,8 @@ npm run serve
 content/                 MDX 章节与学习路线
 src/components/          可复用交互实验与路线组件
 src/lib/labMath.ts       教学实验计算
-src/pages/              首页、实验室
+src/pages/              首页、论文目录
+src/data/papers.ts       论文目录条目
 src/css/custom.css      响应式主题
 tests/                  数值性质与边界测试
 docs/                   技术规划、调研记录与验证记录
@@ -53,6 +54,8 @@ docusaurus.config.ts    网站地址、路径和导航
 ```
 
 新增章节：在对应 `content/` 子目录新增 `.mdx`，以一级标题开始，再把文档 ID 加到 `sidebars.ts`。文件名就是 URL 的一部分，请保持稳定。内部章节链接优先使用相对 `.mdx` 链接，以便构建时检查。
+
+交互实验只放在对应知识章节中，没有独立实验页。论文目录位于 `/papers/`，导读位于 `content/papers/`；新增论文时更新 `src/data/papers.ts` 和 `sidebars.ts` 中的 papers 目录。
 
 正文嵌入 React 实验：
 

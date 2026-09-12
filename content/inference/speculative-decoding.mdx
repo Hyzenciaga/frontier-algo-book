@@ -22,11 +22,11 @@ import {SpeculativeLab} from '@site/src/components/AlgorithmLab';
 
 常见的 greedy 玩具演示是：草稿每步取 `argmax q`，目标若同样取 `argmax p` 就接受，第一次不同便输出目标 argmax。这能说明前缀复用，也能复现目标的**贪心路径**；但没有 `p/q` 的随机接受和残差采样，不能拿来解释「采样分布无损」。真实加速还取决于接受长度、草稿成本、批量大小和 KV cache；草稿越长不必然越快。
 
-## 自测
-
-### 先动手：贪心解码的单轮验证
+## 交互实验：贪心解码的单轮验证
 
 <SpeculativeLab />
+
+## 自测
 
 1. 为什么随机采样拒绝后不能直接从 `p` 重抽？
 2. `p(y)<q(y)` 时，接受率是 `p(y)/q(y)` 还是 0？

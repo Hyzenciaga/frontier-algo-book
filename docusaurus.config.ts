@@ -1,5 +1,6 @@
 import type {Config} from '@docusaurus/types';
 import type {Options, ThemeConfig} from '@docusaurus/preset-classic';
+import {themes as prismThemes} from 'prism-react-renderer';
 import remarkMath from 'remark-math';
 import rehypeKatex from 'rehype-katex';
 
@@ -31,7 +32,7 @@ const config: Config = {
       ],
     },
     footer: {style: 'light', copyright: 'Frontier Algo Book · 从直觉出发，回到原始论文。'},
-    prism: {additionalLanguages: ['python', 'bash']},
+    prism: {theme: prismThemes.github, darkTheme: prismThemes.dracula, additionalLanguages: ['python', 'bash']},
     tableOfContents: {minHeadingLevel: 2, maxHeadingLevel: 3},
   } satisfies ThemeConfig,
 };

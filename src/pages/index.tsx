@@ -11,7 +11,7 @@ export default function Home() {
           <div className="eyebrow">FRONTIER ALGO BOOK <span>自学手册 / 01</span></div>
           <h1>把算法名词，<br/>变成你的<span>知识地图。</span></h1>
           <p>从 SFT 到 Agent 学习，从训练目标到推理加速。<br className="desktop-break"/>沿着依赖关系阅读，用交互实验建立直觉，再回到论文。</p>
-          <div className="intro-actions"><Link className="button button--primary button--lg" to="/learn/roadmap">从学习路线开始 <span aria-hidden="true">→</span></Link><Link className="text-link" to="/papers">浏览论文目录 ↗</Link></div>
+          <div className="intro-actions"><Link className="button button--primary button--lg" to="/learn/roadmap">从学习路线开始 <span aria-hidden="true">→</span></Link><Link className="text-link" to="/papers">浏览经典理论 ↗</Link></div>
           <div className="intro-footnote">中文讲解 <span> / </span> 原始论文 <span> / </span> 可交互示范</div>
         </div>
         <div className="concept-card" aria-label="学习领域图：生成基础分别连接监督学习和推理加速，监督学习连接对齐，再连接 Agent 学习">

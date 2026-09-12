@@ -24,9 +24,9 @@ const config: Config = {
     navbar: {
       title: '前沿算法手册', logo: {alt: '', src: 'img/favicon.svg'},
       items: [
-        {to: '/learn/roadmap', label: '学习路线', position: 'left'},
-        {to: '/papers', label: '论文目录', position: 'left'},
-        {to: '/benchmarks', label: 'Benchmark', position: 'left'},
+        {to: '/learn/roadmap', label: '算法主线', position: 'left'},
+        {to: '/papers', label: '经典理论', position: 'left'},
+        {to: '/benchmarks', label: '评测体系', position: 'left'},
         {href: 'https://github.com/Hyzenciaga/frontier-algo-book', label: 'GitHub', position: 'right'},
       ],
     },

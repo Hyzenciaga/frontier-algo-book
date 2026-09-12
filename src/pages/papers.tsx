@@ -4,9 +4,9 @@ import Link from '@docusaurus/Link';
 import {papers} from '../data/papers';
 
 export default function Papers() {
-  return <Layout title="论文目录" description="按知识点阅读经典论文，从 Attention Is All You Need 与 Transformer 开始。">
+  return <Layout title="经典理论" description="按知识点阅读经典论文，从 Attention Is All You Need 与 Transformer 开始。">
     <main className="papers-page">
-      <header className="papers-intro"><span className="eyebrow">THE READING SHELF</span><h1>论文目录</h1><p>带着问题读原文，把论文接回你的知识地图。</p><div className="papers-summary"><span>{papers.length} 篇已收录</span><span>从模型架构开始</span></div></header>
+      <header className="papers-intro"><span className="eyebrow">THE READING SHELF</span><h1>经典理论</h1><p>带着问题读原文，把论文接回你的知识地图。</p><div className="papers-summary"><span>{papers.length} 篇已收录</span><span>从模型架构开始</span></div></header>
       <section aria-labelledby="architecture-title"><div className="section-title"><div><span className="eyebrow">01 / ARCHITECTURE</span><h2 id="architecture-title">模型架构</h2></div><span className="paper-section-note">建议先读：概率、向量与矩阵乘法</span></div>
         {papers.map((paper, index) => <article className="paper-entry" key={paper.id}>
           <div className="paper-index">{String(index + 1).padStart(2, '0')}<span>{paper.year}</span></div>

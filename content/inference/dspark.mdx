@@ -1,0 +1,33 @@
+# DSpark：半自回归草稿与置信度调度
+
+## 直觉
+
+`dspark` 可核验为 DSpark（Confidence-Scheduled Speculative Decoding with Semi-Autoregressive Generation），不是仅凭相似名字猜出的条目：DeepSeek 的论文、DeepSpec 官方代码库及发布 checkpoint 都使用这一名称。它建立在 DFlash 式块并行草稿上，却补进少量块内顺序依赖，并估计每个位置被接受的可能性，决定值得验证到哪里。
+
+## 前置
+
+DSpark 仍是目标模型验证的投机解码器。置信度只用来裁掉低价值的候选**后缀**、改善吞吐，不应用它直接判定 token 正误；实际 token 的接受与拒绝后校正依然遵循标准 `p/q` 规则。论文也指出全量固定块评测和线上硬件感知调度是两类设置，不能拿一个数字替代另一个。
+
+## 机制
+
+并行主干负责大部分块草稿计算，使草稿延迟对块长不那么敏感；轻量 Markov 或 RNN 头把前一个草稿 token 的信息注入下一位置，缓和纯并行草稿越往后越不可靠的问题。另一个 confidence head 预测各位置接受概率。调度器据校准后的置信度和机器负载选择可验证前缀，并在吞吐估计不再上升时早停，以避免用未来位置的信息倒过来影响当前选择。
+
+## 例子
+
+一个 7-token 草稿的前四位置信度高、后三位急降。在高并发服务中，调度器可能只送前四位给目标验证，把 GPU 批量容量留给其他请求；低并发时，验证更多位置的机会成本较小，选择可不同。无论截到哪里，已送检 token 的随机接受与残差修正不变。
+
+## 误区
+
+DSpark 不是同名第三方「Agent orchestration」项目，也不能把论文的生产流量吞吐结论外推到任意本地单请求。其官方公开实现同时列出 Eagle3、DFlash、DSpark，适合作为比较的共同训练/评测基线；目标模型进入 thinking 模式或换领域时，仓库明确建议重新微调草稿器。
+
+## 自测
+
+1. Markov 头补的是块内什么缺失？
+2. 置信度调度能否替代目标概率验证？
+3. 为什么高、低并发下可选不同验证前缀？
+
+## 原始资料链接
+
+- [DSpark 论文（arXiv）](https://arxiv.org/abs/2607.05147)
+- [DeepSeek 官方 DeepSpec 仓库与 DSpark checkpoint](https://github.com/deepseek-ai/DeepSpec)
+- [vLLM Speculators 的 DSpark 实现文档](https://github.com/vllm-project/speculators/blob/main/docs/user_guide/algorithms/dspark.md)
